@@ -265,11 +265,9 @@ message PTabletWriterCancelRequest {
     repeated int64 tablet_ids = 6;
 };
 
-message PTabletWriterCancelResult {
-};
+message PTabletWriterCancelResult{};
 
-message PExecPlanFragmentRequest {
-};
+message PExecPlanFragmentRequest{};
 
 message PTabletReaderOpenRequest {
     optional PUniqueId id = 1;
@@ -277,17 +275,11 @@ message PTabletReaderOpenRequest {
     optional int64 version = 3;
 }
 
-message PTabletReaderOpenResult {
-    optional StatusPB status = 1;
-}
+message PTabletReaderOpenResult { optional StatusPB status = 1; }
 
-message PTabletReaderCloseRequest {
-    optional PUniqueId id = 1;
-}
+message PTabletReaderCloseRequest { optional PUniqueId id = 1; }
 
-message PTabletReaderCloseResult {
-    optional StatusPB status = 1;
-}
+message PTabletReaderCloseResult { optional StatusPB status = 1; }
 
 message PTabletReaderMultiGetRequest {
     optional int64 tablet_id = 1;
@@ -332,8 +324,7 @@ message PExecPlanFragmentResult {
     required StatusPB status = 1;
 };
 
-message PExecBatchPlanFragmentsRequest {
-};
+message PExecBatchPlanFragmentsRequest{};
 
 message PExecBatchPlanFragmentsResult {
     optional StatusPB status = 1;
@@ -436,9 +427,7 @@ message PKafkaOffsetProxyResult {
     repeated int64 latest_offsets = 3;
 }
 
-message PKafkaOffsetBatchProxyResult {
-    repeated PKafkaOffsetProxyResult results = 1;
-}
+message PKafkaOffsetBatchProxyResult { repeated PKafkaOffsetProxyResult results = 1; }
 
 message PProxyResult {
     required StatusPB status = 1;
@@ -483,9 +472,7 @@ message PPulsarBacklogProxyResult {
     repeated int64 backlog_nums = 2;
 }
 
-message PPulsarBacklogBatchProxyResult {
-    repeated PPulsarBacklogProxyResult results = 1;
-}
+message PPulsarBacklogBatchProxyResult { repeated PPulsarBacklogProxyResult results = 1; }
 
 message PPulsarProxyResult {
     required StatusPB status = 1;
@@ -494,8 +481,7 @@ message PPulsarProxyResult {
     optional PPulsarBacklogBatchProxyResult pulsar_backlog_batch_result = 102;
 };
 
-message PMVMaintenanceTaskRequest {
-};
+message PMVMaintenanceTaskRequest{};
 
 message PMVMaintenanceTaskResult {
     required StatusPB status = 1;
@@ -535,14 +521,14 @@ service PInternalService {
     rpc tablet_writer_add_segment(starrocks.PTabletWriterAddSegmentRequest) returns (starrocks.PTabletWriterAddSegmentResult);
     rpc transmit_runtime_filter(PTransmitRuntimeFilterParams) returns (PTransmitRuntimeFilterResult);
 
-    rpc submit_mv_maintenance_task(PMVMaintenanceTaskRequest) returns (PMVMaintenanceTaskResult);
+    rpc submit_mv_maintenance_task(PMVMaintenanceTaskRequest) returns(PMVMaintenanceTaskResult);
 
     // local tablet reader
-    rpc local_tablet_reader_open(PTabletReaderOpenRequest) returns (PTabletReaderOpenResult);
-    rpc local_tablet_reader_close(PTabletReaderCloseRequest) returns (PTabletReaderCloseResult);
-    rpc local_tablet_reader_multi_get(PTabletReaderMultiGetRequest) returns (PTabletReaderMultiGetResult);
-    rpc local_tablet_reader_scan_open(PTabletReaderScanOpenRequest) returns (PTabletReaderScanOpenResult);
-    rpc local_tablet_reader_scan_get_next(PTabletReaderScanGetNextRequest) returns (PTabletReaderScanGetNextResult);
+    rpc local_tablet_reader_open(PTabletReaderOpenRequest) returns(PTabletReaderOpenResult);
+    rpc local_tablet_reader_close(PTabletReaderCloseRequest) returns(PTabletReaderCloseResult);
+    rpc local_tablet_reader_multi_get(PTabletReaderMultiGetRequest) returns(PTabletReaderMultiGetResult);
+    rpc local_tablet_reader_scan_open(PTabletReaderScanOpenRequest) returns(PTabletReaderScanOpenResult);
+    rpc local_tablet_reader_scan_get_next(PTabletReaderScanGetNextRequest) returns(PTabletReaderScanGetNextResult);
 
-    rpc execute_command(ExecuteCommandRequestPB) returns (ExecuteCommandResultPB);
+    rpc execute_command(ExecuteCommandRequestPB) returns(ExecuteCommandResultPB);
 };

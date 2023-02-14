@@ -243,10 +243,14 @@ private:
 
     bool _skip_fill_local_cache() const { return _opts.reader_type != READER_QUERY; }
 
+    StatusOr<std::unique_ptr<ColumnIterator>> _new_dcg_column_iterator(DeltaColumnGroupList dcgs, uint32_t ucid,
+                                                                       std::string* filename);
+
 private:
     using RawColumnIterators = std::vector<std::unique_ptr<ColumnIterator>>;
     using ColumnDecoders = std::vector<ColumnDecoder>;
     std::shared_ptr<Segment> _segment;
+    std::unordered_map<std::string, std::shared_ptr<Segment>> _dcg_segments;
     SegmentReadOptions _opts;
     RawColumnIterators _column_iterators;
     ColumnDecoders _column_decoders;
@@ -255,10 +259,14 @@ private:
     std::map<ColumnId, ColumnOrPredicate> _del_predicates;
 
     Status _get_del_vec_st;
+    Status _get_dcg_st;
     DelVectorPtr _del_vec;
+    DeltaColumnGroupList _dcgs;
     roaring_uint32_iterator_t _roaring_iter;
 
     std::unordered_map<ColumnId, std::unique_ptr<RandomAccessFile>> _column_files;
+
+    std::vector<std::unique_ptr<RandomAccessFile>> _dcg_rfiles;
 
     SparseRange _scan_range;
     SparseRangeIterator _range_iter;
@@ -317,11 +325,16 @@ SegmentIterator::SegmentIterator(std::shared_ptr<Segment> segment, Schema schema
         TabletSegmentId tsid;
         tsid.tablet_id = _opts.tablet_id;
         tsid.segment_id = _opts.rowset_id + segment_id();
-        _get_del_vec_st = _opts.delvec_loader->load(tsid, _opts.version, &_del_vec);
-        if (_get_del_vec_st.ok()) {
-            if (_del_vec && _del_vec->empty()) {
-                _del_vec.reset();
+        if (_opts.delvec_loader != nullptr) {
+            _get_del_vec_st = _opts.delvec_loader->load(tsid, _opts.version, &_del_vec);
+            if (_get_del_vec_st.ok()) {
+                if (_del_vec && _del_vec->empty()) {
+                    _del_vec.reset();
+                }
             }
+        }
+        if (_opts.dcg_loader != nullptr) {
+            _get_dcg_st = _opts.dcg_loader->load(tsid, _opts.version, _dcgs);
         }
     }
 }
@@ -333,6 +346,9 @@ Status SegmentIterator::_init() {
     }
     if (!_get_del_vec_st.ok()) {
         return _get_del_vec_st;
+    }
+    if (!_get_dcg_st.ok()) {
+        return _get_dcg_st;
     }
     if (_opts.is_primary_keys && _opts.version > 0) {
         if (_del_vec) {
@@ -397,6 +413,56 @@ Status SegmentIterator::_try_to_update_ranges_by_runtime_filter() {
             _opts.stats->raw_rows_read);
 }
 
+StatusOr<std::unique_ptr<ColumnIterator>> SegmentIterator::_new_dcg_column_iterator(DeltaColumnGroupList dcgs,
+                                                                                    uint32_t ucid,
+                                                                                    std::string* filename) {
+    // build column iter from delta column group
+    // iterate dcg from new ver to old ver
+    for (const auto& dcg : dcgs) {
+        int idx = dcg->get_column_idx(ucid);
+        if (idx >= 0) {
+            if (_dcg_segments.count(dcg->column_file()) == 0) {
+                ASSIGN_OR_RETURN(auto dcg_segment, _segment->new_dcg_segment(*dcg));
+                _dcg_segments[dcg->column_file()] = dcg_segment;
+            }
+            if (filename != nullptr) {
+                *filename = dcg->column_file();
+            }
+            return _dcg_segments[dcg->column_file()]->new_column_iterator(idx);
+        }
+    }
+    return nullptr;
+}
+
+Status SegmentIterator::_init_column_iterator_by_cid(const ColumnId cid, const ColumnUID ucid, bool check_dict_enc) {
+    ColumnIteratorOptions iter_opts;
+    iter_opts.stats = _opts.stats;
+    iter_opts.use_page_cache = _opts.use_page_cache;
+    RandomAccessFileOptions opts{.skip_fill_local_cache = _skip_fill_local_cache()};
+    ASSIGN_OR_RETURN(auto rfile, _opts.fs->new_random_access_file(opts, _segment->file_name()));
+    iter_opts.read_file = rfile.get();
+    iter_opts.check_dict_encoding = check_dict_enc;
+    iter_opts.reader_type = _opts.reader_type;
+    if (_dcgs.size() == 0) {
+        ASSIGN_OR_RETURN(_column_iterators[cid], _segment->new_column_iterator(cid));
+    } else {
+        CHECK(ucid >= 0);
+        std::string dcg_filename;
+        ASSIGN_OR_RETURN(auto col_iter, _new_dcg_column_iterator(_dcgs, (uint32_t)ucid, &dcg_filename));
+        if (col_iter == nullptr) {
+            // not found in delta column group
+            ASSIGN_OR_RETURN(_column_iterators[cid], _segment->new_column_iterator(cid));
+        } else {
+            _column_iterators[cid] = std::move(col_iter);
+            ASSIGN_OR_RETURN(auto dcg_file, _opts.fs->new_random_access_file(dcg_filename));
+            iter_opts.read_file = dcg_file.get();
+            _dcg_rfiles.push_back(std::move(dcg_file));
+        }
+    }
+    RETURN_IF_ERROR(_column_iterators[cid]->init(iter_opts));
+    return Status::OK();
+}
+
 template <bool check_global_dict>
 Status SegmentIterator::_init_column_iterators(const Schema& schema) {
     DCHECK_EQ(_predicate_columns, _opts.predicates.size());
@@ -426,18 +492,7 @@ Status SegmentIterator::_init_column_iterators(const Schema& schema) {
                 check_dict_enc = has_predicate;
             }
 
-            ASSIGN_OR_RETURN(_column_iterators[cid], _segment->new_column_iterator(cid));
-
-            ColumnIteratorOptions iter_opts;
-            iter_opts.stats = _opts.stats;
-            iter_opts.use_page_cache = _opts.use_page_cache;
-            RandomAccessFileOptions opts{.skip_fill_local_cache = _skip_fill_local_cache()};
-            ASSIGN_OR_RETURN(auto rfile, _opts.fs->new_random_access_file(opts, _segment->file_name()));
-            iter_opts.read_file = rfile.get();
-            _column_files[cid] = std::move(rfile);
-            iter_opts.check_dict_encoding = check_dict_enc;
-            iter_opts.reader_type = _opts.reader_type;
-            RETURN_IF_ERROR(_column_iterators[cid]->init(iter_opts));
+            RETURN_IF_ERROR(_init_column_iterator_by_cid(cid, f->uid(), check_dict_enc));
 
             if constexpr (check_global_dict) {
                 _column_decoders[cid].set_iterator(_column_iterators[cid].get());
@@ -1560,6 +1615,7 @@ void SegmentIterator::close() {
     _context_list[1].close();
     _column_iterators.resize(0);
     _obj_pool.clear();
+    _dcg_rfiles.clear();
     _segment.reset();
     _column_decoders.clear();
 

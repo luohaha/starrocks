@@ -997,8 +997,10 @@ Status TabletMetaManager::get_del_vector(KVStore* meta, TTabletId tablet_id, uin
         return st;
     }
     if (!found) {
-        return Status::NotFound(strings::Substitute("no delete vector found tablet:$0 segment:$1 version:$2", tablet_id,
-                                                    segment_id, version));
+        *latest_version = 1;
+        delvec->set_empty();
+        //return Status::NotFound(strings::Substitute("no delete vector found tablet:$0 segment:$1 version:$2", tablet_id,
+        //                                            segment_id, version));
     }
     VLOG(3) << strings::Substitute("get_del_vec in-meta tablet_id=$0 segment_id=$1 version=$2 actual_version=$3",
                                    tablet_id, segment_id, version, delvec ? delvec->version() : -1);

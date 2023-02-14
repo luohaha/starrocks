@@ -289,10 +289,6 @@ message OLAPIndexHeaderMessage {
     optional bool delete_flag = 7;
 }
 
-message OLAPDataHeaderMessage {
-    required uint32 segment = 2;
-}
+message OLAPDataHeaderMessage { required uint32 segment = 2; }
 
-message OLAPRawDeltaHeaderMessage {
-    required int32 schema_hash = 2;
-}
+message OLAPRawDeltaHeaderMessage { required int32 schema_hash = 2; }

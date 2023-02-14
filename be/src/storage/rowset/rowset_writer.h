@@ -238,6 +238,23 @@ private:
     std::unique_ptr<VerticalRowsetWriter> _vertical_rowset_writer;
 };
 
+// used for column mode partial update
+class HorizontalUpdateRowsetWriter final : public RowsetWriter {
+public:
+    explicit HorizontalUpdateRowsetWriter(const RowsetWriterContext& context);
+    ~HorizontalUpdateRowsetWriter() override;
+    Status add_chunk(const Chunk& chunk) override;
+
+    Status flush_chunk(const Chunk& chunk, SegmentPB* seg_info = nullptr) override;
+
+    Status flush() override;
+
+private:
+    StatusOr<std::unique_ptr<SegmentWriter>> _create_update_file_writer();
+
+    std::unique_ptr<SegmentWriter> _update_file_writer;
+};
+
 // Chunk contains partial columns data corresponding to column_indexes.
 class VerticalRowsetWriter final : public RowsetWriter {
 public:

@@ -2658,6 +2658,7 @@ Status TabletUpdates::link_from(Tablet* base_tablet, int64_t request_version) {
         rowset_meta_pb.set_tablet_id(tablet_id);
         rowset_meta_pb.set_tablet_schema_hash(_tablet.schema_hash());
         new_rowset_info.delvecs.resize(new_rowset_info.num_segments);
+        new_rowset_info.dcgs.resize(new_rowset_info.num_segments);
         for (uint32_t j = 0; j < new_rowset_info.num_segments; j++) {
             TabletSegmentId tsid;
             tsid.tablet_id = src_rowset.rowset_meta()->tablet_id();
@@ -2665,6 +2666,14 @@ Status TabletUpdates::link_from(Tablet* base_tablet, int64_t request_version) {
             Status st = update_manager->get_del_vec(kv_store, tsid, version.major(), &new_rowset_info.delvecs[j]);
             if (!st.ok()) {
                 return st;
+            }
+            st = update_manager->get_delta_column_group(kv_store, tsid, version.major(), new_rowset_info.dcgs[j]);
+            if (!st.ok()) {
+                return st;
+            }
+            // rename column file in delta column group
+            for (auto& dcg : new_rowset_info.dcgs[j]) {
+                dcg->rename_column_file(_tablet.schema_hash_path(), rid, j);
             }
         }
         next_rowset_id += std::max(1U, (uint32_t)new_rowset_info.num_segments);
@@ -2699,6 +2708,7 @@ Status TabletUpdates::link_from(Tablet* base_tablet, int64_t request_version) {
     RETURN_IF_ERROR(TabletMetaManager::clear_log(data_dir, &wb, tablet_id));
     RETURN_IF_ERROR(TabletMetaManager::clear_rowset(data_dir, &wb, tablet_id));
     RETURN_IF_ERROR(TabletMetaManager::clear_del_vector(data_dir, &wb, tablet_id));
+    RETURN_IF_ERROR(TabletMetaManager::clear_delta_column_group(data_dir, &wb, tablet_id));
     RETURN_IF_ERROR(TabletMetaManager::clear_persistent_index(data_dir, &wb, tablet_id));
     // do not clear pending rowsets, because these pending rowsets should be committed after schemachange is done
     RETURN_IF_ERROR(TabletMetaManager::put_tablet_meta(data_dir, &wb, meta_pb));
@@ -2707,6 +2717,8 @@ Status TabletUpdates::link_from(Tablet* base_tablet, int64_t request_version) {
         for (int j = 0; j < info.num_segments; j++) {
             RETURN_IF_ERROR(
                     TabletMetaManager::put_del_vector(data_dir, &wb, tablet_id, info.rowset_id + j, *info.delvecs[j]));
+            RETURN_IF_ERROR(TabletMetaManager::put_delta_column_group(data_dir, &wb, tablet_id, info.rowset_id + j,
+                                                                      info.dcgs[j]));
         }
     }
 
@@ -3377,6 +3389,15 @@ Status TabletUpdates::load_snapshot(const SnapshotMeta& snapshot_meta, bool rest
                 return Status::InternalError("delete file does not exist: " + st.to_string());
             }
         }
+        for (int upt_id = 0; upt_id < rowset.num_update_files(); upt_id++) {
+            RowsetId rowset_id;
+            rowset_id.init(rowset.rowset_id());
+            auto path = Rowset::segment_upt_file_path(_tablet.schema_hash_path(), rowset_id, upt_id);
+            auto st = FileSystem::Default()->path_exists(path);
+            if (!st.ok()) {
+                return Status::InternalError("update file does not exist: " + st.to_string());
+            }
+        }
         return Status::OK();
     };
 
@@ -3491,6 +3512,10 @@ Status TabletUpdates::load_snapshot(const SnapshotMeta& snapshot_meta, bool rest
         for (const auto& [rssid, delvec] : snapshot_meta.delete_vectors()) {
             auto id = rssid + _next_rowset_id;
             CHECK_FAIL(TabletMetaManager::put_del_vector(data_store, &wb, tablet_id, id, delvec));
+        }
+        for (const auto& [rssid, dcglist] : snapshot_meta.delta_column_groups()) {
+            auto id = rssid + _next_rowset_id;
+            CHECK_FAIL(TabletMetaManager::put_delta_column_group(data_store, &wb, tablet_id, id, dcglist));
         }
         for (const auto& [rid, rowset] : _rowsets) {
             RowsetMetaPB meta_pb = rowset->rowset_meta()->to_rowset_pb();

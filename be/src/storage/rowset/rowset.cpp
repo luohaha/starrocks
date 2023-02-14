@@ -417,6 +417,22 @@ Status Rowset::copy_files_to(const std::string& dir) {
             }
         }
     }
+    for (int i = 0; i < num_update_files(); ++i) {
+        std::string src_path = segment_upt_file_path(_rowset_path, rowset_id(), i);
+        if (fs::path_exist(src_path)) {
+            std::string dst_path = segment_upt_file_path(dir, rowset_id(), i);
+            if (fs::path_exist(dst_path)) {
+                LOG(WARNING) << "Path already exist: " << dst_path;
+                return Status::AlreadyExist(fmt::format("Path already exist: {}", dst_path));
+            }
+            if (!fs::copy_file(src_path, dst_path).ok()) {
+                LOG(WARNING) << "Error to copy file. src:" << src_path << ", dst:" << dst_path
+                             << ", errno=" << Errno::no();
+                return Status::IOError(fmt::format("Error to copy file. src: {}, dst: {}, error:{} ", src_path,
+                                                   dst_path, std::strerror(Errno::no())));
+            }
+        }
+    }
     return Status::OK();
 }
 
@@ -493,6 +509,7 @@ Status Rowset::get_segment_iterators(const Schema& schema, const RowsetReadOptio
         seg_options.rowset_id = rowset_meta()->get_rowset_seg_id();
         seg_options.version = options.version;
         seg_options.delvec_loader = std::make_shared<LocalDelvecLoader>(options.meta);
+        seg_options.dcg_loader = std::make_shared<LocalDeltaColumnGroupLoader>(options.meta);
     }
     seg_options.rowid_range_option = options.rowid_range_option;
     seg_options.short_key_ranges = options.short_key_ranges;
@@ -567,6 +584,7 @@ StatusOr<std::vector<ChunkIteratorPtr>> Rowset::get_segment_iterators2(const Sch
     seg_options.rowset_id = rowset_meta()->get_rowset_seg_id();
     seg_options.version = version;
     seg_options.delvec_loader = std::make_shared<LocalDelvecLoader>(meta);
+    seg_options.dcg_loader = std::make_shared<LocalDeltaColumnGroupLoader>(meta);
 
     std::vector<ChunkIteratorPtr> seg_iterators(num_segments());
     TabletSegmentId tsid;
