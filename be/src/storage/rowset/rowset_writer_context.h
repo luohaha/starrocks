@@ -86,6 +86,8 @@ public:
     std::string merge_condition;
 
     bool miss_auto_increment_column = false;
+    // partial update mode
+    PartialUpdateMode partial_update_mode = PartialUpdateMode::ROW_MODE;
 };
 
 } // namespace starrocks
