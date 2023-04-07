@@ -1,0 +1,51 @@
+-- name: test_sr_20892
+show backends;
+drop database if exists test_sr_20892;
+-- result:
+-- !result
+create database test_sr_20892;
+-- result:
+-- !result
+use test_sr_20892;
+-- result:
+-- !result
+create table uniq_tbl(k1 int,k2 string,k3 boolean,k4 bigint default "666")  unique key(k1,k2) distributed by hash(k1) buckets 3 PROPERTIES (
+"replication_num" = "1");
+-- result:
+-- !result
+drop database test_sr_20892;
+-- result:
+-- !result
+recover database test_sr_20892;
+-- result:
+-- !result
+use test_sr_20892;
+-- result:
+-- !result
+insert into uniq_tbl values(1, 'insert values: 1', 1, default);
+-- result:
+-- !result
+insert into uniq_tbl(k1,k2,k3) values(1, 'insert values: 1', 0);
+-- result:
+-- !result
+select * from uniq_tbl order by 1 limit 5;
+-- result:
+1	insert values: 1	0	666
+-- !result
+select count(distinct k4) from uniq_tbl;
+-- result:
+1
+-- !result
+drop table uniq_tbl;
+-- result:
+-- !result
+recover table uniq_tbl;
+-- result:
+-- !result
+select count(distinct k4) from uniq_tbl;
+-- result:
+1
+-- !result
+insert into uniq_tbl values(11, 'insert values: 11', 1, default);
+-- result:
+-- !result

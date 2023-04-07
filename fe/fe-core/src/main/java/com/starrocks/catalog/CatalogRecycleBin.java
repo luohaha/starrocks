@@ -525,6 +525,7 @@ public class CatalogRecycleBin extends LeaderDaemon implements Writable {
         Database db = dbInfo.getDb();
         Set<String> tableNames = Sets.newHashSet(dbInfo.getTableNames());
         long dbId = db.getId();
+        Map<String, RecycleTableInfo> nameToTableInfoDbLevel = nameToTableInfo.row(dbId);
         Iterator<Map.Entry<Long, RecycleTableInfo>> iterator = idToTableInfo.row(dbId).entrySet().iterator();
         while (iterator.hasNext()) {
             Map.Entry<Long, RecycleTableInfo> entry = iterator.next();
@@ -537,6 +538,7 @@ public class CatalogRecycleBin extends LeaderDaemon implements Writable {
             db.createTable(table);
             LOG.info("recover db[{}] with table[{}]: {}", dbId, table.getId(), table.getName());
             iterator.remove();
+            nameToTableInfoDbLevel.remove(table.getName());
             removeRecycleMarkers(table.getId());
             tableNames.remove(table.getName());
         }
