@@ -14,11 +14,13 @@
 
 package com.starrocks.sql.ast;
 
+import com.google.common.collect.Sets;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.Table;
 
 import java.util.List;
+import java.util.Set;
 
 public class UpdateStmt extends DmlStmt {
     private final TableName tableName;
@@ -26,9 +28,12 @@ public class UpdateStmt extends DmlStmt {
     private final List<Relation> fromRelations;
     private final Expr wherePredicate;
     private final List<CTERelation> commonTableExpressions;
+    private final Set<String> assignmentColumns;
 
     private Table table;
     private QueryStatement queryStatement;
+
+    private boolean usePartialUpdate;
 
     public UpdateStmt(TableName tableName, List<ColumnAssignment> assignments, List<Relation> fromRelations,
                       Expr wherePredicate, List<CTERelation> commonTableExpressions) {
@@ -37,6 +42,15 @@ public class UpdateStmt extends DmlStmt {
         this.fromRelations = fromRelations;
         this.wherePredicate = wherePredicate;
         this.commonTableExpressions = commonTableExpressions;
+        this.assignmentColumns = Sets.newHashSet();
+        for (ColumnAssignment each : assignments) {
+            this.assignmentColumns.add(each.getColumn());
+        }
+        this.usePartialUpdate = false;
+    }
+
+    public boolean isAssignmentColumn(String colName) {
+        return assignmentColumns.contains(colName);
     }
 
     @Override
@@ -74,6 +88,14 @@ public class UpdateStmt extends DmlStmt {
 
     public QueryStatement getQueryStatement() {
         return queryStatement;
+    }
+
+    public void setUsePartialUpdate() {
+        this.usePartialUpdate = true;
+    }
+
+    public boolean usePartialUpdate() {
+        return this.usePartialUpdate;
     }
 
     public <R, C> R accept(AstVisitor<R, C> visitor, C context) {

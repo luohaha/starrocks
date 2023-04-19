@@ -97,6 +97,7 @@ public class LoadStmt extends DdlStmt {
     public static final String PARTIAL_UPDATE = "partial_update";
     public static final String PRIORITY = "priority";
     public static final String MERGE_CONDITION = "merge_condition";
+    public static final String PARTIAL_UPDATE_MODE = "partial_update_mode";
 
     // for load data from Baidu Object Store(BOS)
     public static final String BOS_ENDPOINT = "bos_endpoint";
@@ -134,6 +135,7 @@ public class LoadStmt extends DdlStmt {
             .add(TIMEZONE)
             .add(PARTIAL_UPDATE)
             .add(PRIORITY)
+            .add(PARTIAL_UPDATE_MODE)
             .build();
 
     public LoadStmt(LabelName label, List<DataDescription> dataDescriptions,

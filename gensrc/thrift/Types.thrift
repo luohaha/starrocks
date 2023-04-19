@@ -506,4 +506,5 @@ enum TPartialUpdateMode {
     UNKNOWN_MODE = 0;
     ROW_MODE = 1;
     COLUMN_MODE = 2;
+    AUTO_MODE = 3;
 }

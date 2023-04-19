@@ -186,6 +186,7 @@ public class CreateRoutineLoadStmt extends DdlStmt {
     private String timezone = TimeUtils.DEFAULT_TIME_ZONE;
     private boolean partialUpdate = false;
     private String mergeConditionStr;
+    private String partialUpdateMode = "row";
     /**
      * RoutineLoad support json data.
      * Require Params:
@@ -324,6 +325,10 @@ public class CreateRoutineLoadStmt extends DdlStmt {
 
     public boolean isPartialUpdate() {
         return partialUpdate;
+    }
+
+    public String getPartialUpdateMode() {
+        return partialUpdateMode;
     }
 
     public String getMergeConditionStr() {
@@ -501,6 +506,8 @@ public class CreateRoutineLoadStmt extends DdlStmt {
                 LoadStmt.PARTIAL_UPDATE + " should be a boolean");
 
         mergeConditionStr = jobProperties.get(LoadStmt.MERGE_CONDITION);
+
+        partialUpdateMode = jobProperties.get(LoadStmt.PARTIAL_UPDATE_MODE);
 
         if (ConnectContext.get() != null) {
             timezone = ConnectContext.get().getSessionVariable().getTimeZone();
