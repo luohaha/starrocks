@@ -69,7 +69,6 @@ import com.starrocks.sql.ast.LoadStmt;
 import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.thrift.TLoadJobType;
 import com.starrocks.thrift.TPartialUpdateMode;
-import com.starrocks.thrift.TReportExecStatusParams;
 import com.starrocks.thrift.TUniqueId;
 import com.starrocks.transaction.BeginTransactionException;
 import com.starrocks.transaction.TransactionState;
