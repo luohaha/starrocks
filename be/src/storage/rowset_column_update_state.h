@@ -51,16 +51,21 @@ struct ColumnPartialUpdateState {
     EditVersion read_version;
     // Maintains the mapping of source row to update segment's row
     std::map<uint64_t, uint32_t> rss_rowid_to_update_rowid;
+    // record the rowid that isn't update the exist row
+    std::vector<uint32_t> missing_update_rowid;
 
     // build `rss_rowid_to_update_rowid` from `src_rss_rowids`
     void build_rss_rowid_to_update_rowid() {
         rss_rowid_to_update_rowid.clear();
+        missing_update_rowid.clear();
         for (uint32_t upt_id = 0; upt_id < src_rss_rowids.size(); upt_id++) {
             uint64_t each_rss_rowid = src_rss_rowids[upt_id];
             // build rssid & rowid -> update file's rowid
             // each_rss_rowid == UINT64_MAX means that key not exist in pk index
             if (each_rss_rowid < UINT64_MAX) {
                 rss_rowid_to_update_rowid[each_rss_rowid] = upt_id;
+            } else {
+                missing_update_rowid.push_back(upt_id);
             }
         }
     }
@@ -94,6 +99,8 @@ public:
     // |tablet| : current tablet
     // |index| : tablet's primary key index
     Status finalize(Tablet* tablet, Rowset* rowset, const PrimaryIndex& index);
+
+    Status write_segment_with_default_column(Tablet* tablet, Rowset* rowset);
 
     const std::vector<ColumnUniquePtr>& upserts() const { return _upserts; }
 

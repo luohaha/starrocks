@@ -871,7 +871,14 @@ void TabletUpdates::_apply_column_partial_update_commit(const EditVersionInfo& v
         return;
     }
 
-    // 4. write meta and make it apply.
+    // 4. write segment 
+    st = state.write_segment_with_default_column(&_tablet, rowset.get());
+    if (!st.ok()) {
+        failure_handler("write segment failed", st);
+        return;
+    }
+
+    // 5. write meta and make it apply.
     {
         std::lock_guard wl(_lock);
         if (_edit_version_infos.empty()) {

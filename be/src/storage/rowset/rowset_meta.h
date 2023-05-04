@@ -199,6 +199,8 @@ public:
 
     const RowsetMetaPB& get_meta_pb() const { return *_rowset_meta_pb; }
 
+    RowsetMetaPB& get_meta_pb() { return *_rowset_meta_pb; }
+
 private:
     bool _deserialize_from_pb(std::string_view value) {
         return _rowset_meta_pb->ParseFromArray(value.data(), value.size());

@@ -168,6 +168,7 @@ public:
     StatusOr<int64_t> estimate_compaction_segment_iterator_num();
 
     const RowsetMetaSharedPtr& rowset_meta() const { return _rowset_meta; }
+    RowsetMetaSharedPtr& rowset_meta() { return _rowset_meta; }
 
     std::vector<SegmentSharedPtr>& segments() { return _segments; }
 

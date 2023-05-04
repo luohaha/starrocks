@@ -22,6 +22,7 @@
 #include "storage/delta_column_group.h"
 #include "storage/primary_key_encoder.h"
 #include "storage/rowset/column_iterator.h"
+#include "storage/rowset/default_value_column_iterator.h"
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/rowset_options.h"
 #include "storage/rowset/segment_options.h"
@@ -403,6 +404,107 @@ Status RowsetColumnUpdateState::_read_chunk_from_update(const RowidsToUpdateRowi
         } else {
             result_chunk->append_selective(*_update_chunk_cache[cur_update_file_id], batch_append_rowids.data(), 0,
                                            batch_append_rowids.size());
+        }
+    }
+    return Status::OK();
+}
+
+Status append_default_value(Tablet* tablet, Columns& columns, const std::unordered_set<uint32_t>& skip_column_ids,
+                            size_t N) {
+    for (auto cid = 0; cid < tablet->tablet_schema().num_columns(); ++cid) {
+        if (skip_column_ids.count(cid) > 0) continue;
+        const TabletColumn& tablet_column = tablet->tablet_schema().column(cid);
+        if (tablet_column.has_default_value()) {
+            const TypeInfoPtr& type_info = get_type_info(tablet_column);
+            std::unique_ptr<DefaultValueColumnIterator> default_value_iter =
+                    std::make_unique<DefaultValueColumnIterator>(
+                            tablet_column.has_default_value(), tablet_column.default_value(),
+                            tablet_column.is_nullable(), type_info, tablet_column.length(), N);
+            ColumnIteratorOptions iter_opts;
+            RETURN_IF_ERROR(default_value_iter->init(iter_opts));
+            default_value_iter->fetch_values_by_rowid(nullptr, N, columns[cid].get());
+        } else {
+            columns[cid]->append_default(N);
+        }
+    }
+    return Status::OK();
+}
+
+StatusOr<std::unique_ptr<SegmentWriter>> prepare_segment_writer(Rowset* rowset, std::shared_ptr<TabletSchema> tschema,
+                                                                int segment_id) {
+    ASSIGN_OR_RETURN(auto fs, FileSystem::CreateSharedFromString(rowset->rowset_path()));
+    const std::string path = Rowset::segment_file_path(rowset->rowset_path(), rowset->rowset_id(), segment_id);
+    (void)fs->delete_file(path); // delete segment if already exist
+    WritableFileOptions opts{.sync_on_close = true};
+    ASSIGN_OR_RETURN(auto wfile, fs->new_writable_file(opts, path));
+    SegmentWriterOptions writer_options;
+    auto segment_writer = std::make_unique<SegmentWriter>(std::move(wfile), segment_id, tschema.get(), writer_options);
+    RETURN_IF_ERROR(segment_writer->init());
+    return std::move(segment_writer);
+}
+
+Status RowsetColumnUpdateState::write_segment_with_default_column(Tablet* tablet, Rowset* rowset) {
+    const auto& txn_meta = rowset->rowset_meta()->get_meta_pb().txn_meta();
+    ChunkUniquePtr container;
+    std::vector<uint32_t> update_column_ids;
+    std::unordered_set<uint32_t> skip_columns_ids;
+    OlapReaderStatistics stats;
+    Schema partial_schema;
+    auto tschema_ptr = TabletSchema::create(tablet->tablet_schema());
+    std::vector<ChunkIteratorPtr> update_file_iters;
+    int num_segment = 0;
+    int64_t total_row_size = 0;
+    int64_t total_data_size = 0;
+    int64_t total_index_size = 0;
+    int64_t num_rows_written = 0;
+    // 1. get chunk from update files and fill up missing columns with default values
+    for (int upt_id = 0; upt_id < _partial_update_states.size(); upt_id++) {
+        if (_partial_update_states[upt_id].missing_update_rowid.size() > 0) {
+            if (container == nullptr) {
+                Schema schema = ChunkHelper::convert_schema(tablet->tablet_schema());
+                container = ChunkHelper::new_chunk(schema, 1024);
+                for (uint32_t cid : txn_meta.partial_update_column_ids()) {
+                    update_column_ids.push_back(cid);
+                    skip_columns_ids.insert(cid);
+                }
+                partial_schema = ChunkHelper::convert_schema(tablet->tablet_schema(), update_column_ids);
+                ASSIGN_OR_RETURN(update_file_iters, rowset->get_update_file_iterators(partial_schema, &stats));
+            }
+            ChunkPtr update_chunk = ChunkHelper::new_shared_chunk(partial_schema, 1024);
+            read_chunk_from_update_file({update_file_iters[upt_id]}, update_chunk);
+            for (int i = 0; i < txn_meta.partial_update_column_ids_size(); i++) {
+                uint32_t cid = txn_meta.partial_update_column_ids(i);
+                container->columns()[cid]->append_selective(*update_chunk->columns()[i],
+                                                            _partial_update_states[upt_id].missing_update_rowid);
+            }
+            RETURN_IF_ERROR(append_default_value(tablet, container->columns(), skip_columns_ids,
+                                                 _partial_update_states[upt_id].missing_update_rowid.size()));
+            // 2. write and generate segment files
+            uint64_t segment_file_size = 0;
+            uint64_t index_size = 0;
+            uint64_t footer_position = 0;
+            ASSIGN_OR_RETURN(segment_writer, prepare_segment_writer(rowset, tschema_ptr, num_segment++));
+            RETURN_IF_ERROR(segment_writer->init());
+            RETURN_IF_ERROR(segment_writer->append_chunk(*container));
+            RETURN_IF_ERROR(segment_writer->finalize(segment_file_size, index_size, footer_position));
+            num_rows_written += static_cast<int64_t>(container->num_rows());
+            total_row_size += static_cast<int64_t>(container->bytes_usage());
+            total_data_size += static_cast<int64_t>(segment_file_size);
+            total_index_size += static_cast<int64_t>(index_size);
+            container->reset();
+        }
+    }
+    // 3. change rowset
+    if (num_segment > 0) {
+        auto& rowset_meta_pb = rowset->rowset_meta()->get_meta_pb();
+        rowset_meta_pb.set_num_rows(num_rows_written);
+        rowset_meta_pb.set_total_row_size(total_row_size);
+        rowset_meta_pb.set_total_disk_size(total_data_size);
+        rowset_meta_pb.set_data_disk_size(total_data_size);
+        rowset_meta_pb.set_index_disk_size(total_index_size);
+        rowset_meta_pb.set_num_segments(num_segment);
+        if (num_segment <= 1) {
+            rowset_meta_pb.set_segments_overlap_pb(NONOVERLAPPING);
         }
     }
     return Status::OK();

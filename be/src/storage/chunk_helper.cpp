@@ -407,6 +407,18 @@ ChunkUniquePtr ChunkHelper::new_chunk(const Schema& schema, size_t n) {
     return std::make_unique<Chunk>(std::move(columns), std::make_shared<Schema>(schema));
 }
 
+ChunkPtr ChunkHelper::new_shared_chunk(const Schema& schema, size_t n) {
+    size_t fields = schema.num_fields();
+    Columns columns;
+    columns.reserve(fields);
+    for (size_t i = 0; i < fields; i++) {
+        const FieldPtr& f = schema.field(i);
+        columns.emplace_back(column_from_field(*f));
+        columns.back()->reserve(n);
+    }
+    return std::make_shared<Chunk>(std::move(columns), std::make_shared<Schema>(schema));
+}
+
 ChunkUniquePtr ChunkHelper::new_chunk(const TupleDescriptor& tuple_desc, size_t n) {
     return new_chunk(tuple_desc.slots(), n);
 }

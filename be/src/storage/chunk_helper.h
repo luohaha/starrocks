@@ -55,6 +55,9 @@ public:
     // Create an empty chunk according to the |schema| and reserve it of size |n|.
     static ChunkUniquePtr new_chunk(const Schema& schema, size_t n);
 
+    // Create an empty chunk according to the |schema| and reserve it of size |n|.
+    static ChunkPtr new_shared_chunk(const Schema& schema, size_t n);
+
     // Create an empty chunk according to the |tuple_desc| and reserve it of size |n|.
     static ChunkUniquePtr new_chunk(const TupleDescriptor& tuple_desc, size_t n);
 
