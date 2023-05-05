@@ -430,7 +430,7 @@ Status append_default_value(Tablet* tablet, Columns& columns, const std::unorder
     return Status::OK();
 }
 
-StatusOr<std::unique_ptr<SegmentWriter>> prepare_segment_writer(Rowset* rowset, std::shared_ptr<TabletSchema> tschema,
+StatusOr<std::unique_ptr<SegmentWriter>> prepare_segment_writer(Rowset* rowset, const TabletSchema* tschema,
                                                                 int segment_id) {
     ASSIGN_OR_RETURN(auto fs, FileSystem::CreateSharedFromString(rowset->rowset_path()));
     const std::string path = Rowset::segment_file_path(rowset->rowset_path(), rowset->rowset_id(), segment_id);
@@ -438,7 +438,7 @@ StatusOr<std::unique_ptr<SegmentWriter>> prepare_segment_writer(Rowset* rowset, 
     WritableFileOptions opts{.sync_on_close = true};
     ASSIGN_OR_RETURN(auto wfile, fs->new_writable_file(opts, path));
     SegmentWriterOptions writer_options;
-    auto segment_writer = std::make_unique<SegmentWriter>(std::move(wfile), segment_id, tschema.get(), writer_options);
+    auto segment_writer = std::make_unique<SegmentWriter>(std::move(wfile), segment_id, tschema, writer_options);
     RETURN_IF_ERROR(segment_writer->init());
     return std::move(segment_writer);
 }
@@ -450,7 +450,6 @@ Status RowsetColumnUpdateState::write_segment_with_default_column(Tablet* tablet
     std::unordered_set<uint32_t> skip_columns_ids;
     OlapReaderStatistics stats;
     Schema partial_schema;
-    auto tschema_ptr = TabletSchema::create(tablet->tablet_schema());
     std::vector<ChunkIteratorPtr> update_file_iters;
     int num_segment = 0;
     int64_t total_row_size = 0;
@@ -483,10 +482,12 @@ Status RowsetColumnUpdateState::write_segment_with_default_column(Tablet* tablet
             uint64_t segment_file_size = 0;
             uint64_t index_size = 0;
             uint64_t footer_position = 0;
-            ASSIGN_OR_RETURN(segment_writer, prepare_segment_writer(rowset, tschema_ptr, num_segment++));
+            ASSIGN_OR_RETURN(auto segment_writer,
+                             prepare_segment_writer(rowset, &tablet->tablet_schema(), num_segment++));
             RETURN_IF_ERROR(segment_writer->init());
             RETURN_IF_ERROR(segment_writer->append_chunk(*container));
-            RETURN_IF_ERROR(segment_writer->finalize(segment_file_size, index_size, footer_position));
+            RETURN_IF_ERROR(segment_writer->finalize(&segment_file_size, &index_size, &footer_position));
+            LOG(INFO) << "write segment: " << segment_writer->segment_path();
             num_rows_written += static_cast<int64_t>(container->num_rows());
             total_row_size += static_cast<int64_t>(container->bytes_usage());
             total_data_size += static_cast<int64_t>(segment_file_size);
@@ -506,6 +507,7 @@ Status RowsetColumnUpdateState::write_segment_with_default_column(Tablet* tablet
         if (num_segment <= 1) {
             rowset_meta_pb.set_segments_overlap_pb(NONOVERLAPPING);
         }
+        LOG(INFO) << "tablet_id " << tablet->tablet_id() << " write segment with default column: " << num_segment;
     }
     return Status::OK();
 }
