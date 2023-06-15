@@ -75,6 +75,7 @@
 #include "util/metrics.h"
 #include "util/starrocks_metrics.h"
 #include "util/string_parser.hpp"
+#include "util/threadpool.h"
 #include "util/thrift_rpc_helper.h"
 #include "util/time.h"
 #include "util/uid_util.h"
@@ -124,7 +125,8 @@ static bool is_format_support_streaming(TFileFormatType::type format) {
     }
 }
 
-StreamLoadAction::StreamLoadAction(ExecEnv* exec_env) : _exec_env(exec_env) {
+StreamLoadAction::StreamLoadAction(ExecEnv* exec_env, ThreadPool* async_http_worker)
+        : _exec_env(exec_env), _async_http_worker(async_http_worker) {
     StarRocksMetrics::instance()->metrics()->register_metric("streaming_load_requests_total",
                                                              &streaming_load_requests_total);
     StarRocksMetrics::instance()->metrics()->register_metric("streaming_load_bytes", &streaming_load_bytes);
@@ -136,39 +138,46 @@ StreamLoadAction::StreamLoadAction(ExecEnv* exec_env) : _exec_env(exec_env) {
 StreamLoadAction::~StreamLoadAction() = default;
 
 void StreamLoadAction::handle(HttpRequest* req) {
-    auto* ctx = (StreamLoadContext*)req->handler_ctx();
-    if (ctx == nullptr) {
-        return;
-    }
+    // take owner
+    req->take_owner();
+    auto job = [&]() {
+        // need to manual free request after take owner
+        DeferOp free_request([&]() { evhttp_request_free(req->get_evhttp_request()); });
+        auto* ctx = (StreamLoadContext*)req->handler_ctx();
+        if (ctx == nullptr) {
+            return;
+        }
 
-    // status already set to fail
-    if (ctx->status.ok()) {
-        ctx->status = _handle(ctx);
+        // status already set to fail
+        if (ctx->status.ok()) {
+            ctx->status = _handle(ctx);
+            if (!ctx->status.ok() && ctx->status.code() != TStatusCode::PUBLISH_TIMEOUT) {
+                LOG(WARNING) << "Fail to handle streaming load, id=" << ctx->id
+                             << " errmsg=" << ctx->status.get_error_msg();
+            }
+        }
+        ctx->load_cost_nanos = MonotonicNanos() - ctx->start_nanos;
+
         if (!ctx->status.ok() && ctx->status.code() != TStatusCode::PUBLISH_TIMEOUT) {
-            LOG(WARNING) << "Fail to handle streaming load, id=" << ctx->id
-                         << " errmsg=" << ctx->status.get_error_msg();
+            if (ctx->need_rollback) {
+                _exec_env->stream_load_executor()->rollback_txn(ctx);
+                ctx->need_rollback = false;
+            }
+            if (ctx->body_sink != nullptr) {
+                ctx->body_sink->cancel(ctx->status);
+            }
         }
-    }
-    ctx->load_cost_nanos = MonotonicNanos() - ctx->start_nanos;
 
-    if (!ctx->status.ok() && ctx->status.code() != TStatusCode::PUBLISH_TIMEOUT) {
-        if (ctx->need_rollback) {
-            _exec_env->stream_load_executor()->rollback_txn(ctx);
-            ctx->need_rollback = false;
-        }
-        if (ctx->body_sink != nullptr) {
-            ctx->body_sink->cancel(ctx->status);
-        }
-    }
+        auto str = ctx->to_json();
+        HttpChannel::send_reply(req, str);
 
-    auto str = ctx->to_json();
-    HttpChannel::send_reply(req, str);
-
-    // update statstics
-    streaming_load_requests_total.increment(1);
-    streaming_load_duration_ms.increment(ctx->load_cost_nanos / 1000000);
-    streaming_load_bytes.increment(ctx->receive_bytes);
-    streaming_load_current_processing.increment(-1);
+        // update statstics
+        streaming_load_requests_total.increment(1);
+        streaming_load_duration_ms.increment(ctx->load_cost_nanos / 1000000);
+        streaming_load_bytes.increment(ctx->receive_bytes);
+        streaming_load_current_processing.increment(-1);
+    };
+    _async_http_worker->submit_func(job);
 }
 
 Status StreamLoadAction::_handle(StreamLoadContext* ctx) {

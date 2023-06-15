@@ -134,4 +134,8 @@ const char* HttpRequest::remote_host() const {
     return _ev_req->remote_host;
 }
 
+void HttpRequest::take_owner() {
+    evhttp_request_own(_ev_req);
+}
+
 } // namespace starrocks

@@ -47,10 +47,11 @@ namespace starrocks {
 class ExecEnv;
 class Status;
 class StreamLoadContext;
+class ThreadPool;
 
 class StreamLoadAction : public HttpHandler {
 public:
-    explicit StreamLoadAction(ExecEnv* exec_env);
+    explicit StreamLoadAction(ExecEnv* exec_env, ThreadPool* async_http_worker);
     ~StreamLoadAction() override;
 
     void handle(HttpRequest* req) override;
@@ -71,6 +72,7 @@ private:
 
 private:
     ExecEnv* _exec_env;
+    ThreadPool* _async_http_worker;
 };
 
 } // namespace starrocks

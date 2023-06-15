@@ -75,14 +75,20 @@ HttpServiceBE::~HttpServiceBE() {
     _ev_http_server->stop();
     _ev_http_server.reset();
     _web_page_handler.reset();
+    // shutdown worker first, then free handlers
+    _async_http_worker->shutdown();
     STLDeleteElements(&_http_handlers);
 }
 
 Status HttpServiceBE::start() {
+    RETURN_IF_ERROR(ThreadPoolBuilder("async_http_worker")
+                            .set_min_threads(config::be_async_http_num_workers / 2)
+                            .set_max_threads(config::be_async_http_num_workers)
+                            .build(&(_async_http_worker)));
     add_default_path_handlers(_web_page_handler.get(), _env->process_mem_tracker());
 
     // register load
-    auto* stream_load_action = new StreamLoadAction(_env);
+    auto* stream_load_action = new StreamLoadAction(_env, _async_http_worker.get());
     _ev_http_server->register_handler(HttpMethod::PUT, "/api/{db}/{table}/_stream_load", stream_load_action);
     _http_handlers.emplace_back(stream_load_action);
 

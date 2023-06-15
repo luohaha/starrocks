@@ -44,6 +44,7 @@ class ExecEnv;
 class EvHttpServer;
 class HttpHandler;
 class WebPageHandler;
+class ThreadPool;
 
 // HTTP service for StarRocks BE
 class HttpServiceBE {
@@ -60,6 +61,8 @@ private:
     std::unique_ptr<WebPageHandler> _web_page_handler;
 
     std::vector<HttpHandler*> _http_handlers;
+    // async worker for heavy job
+    std::unique_ptr<ThreadPool> _async_http_worker;
 };
 
 } // namespace starrocks
