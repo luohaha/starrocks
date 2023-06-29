@@ -451,6 +451,26 @@ void DataDir::perform_path_gc_by_tablet() {
     LOG(INFO) << "finished one time path gc by tablet.";
 }
 
+Status DataDir::scan_useful_delta_column_files(
+        int64_t tablet_id, std::unordered_map<int64_t, std::unordered_set<std::string>>& delta_column_files) {
+    if (delta_column_files.count(tablet_id) > 0) {
+        // already scan this tablet, skip this time.
+        return Status::OK();
+    }
+    DeltaColumnGroupList dcgs;
+    RETURN_IF_ERROR(TabletMetaManager::scan_tablet_delta_column_group(_kv_store, tablet_id, &dcgs));
+    auto& files = delta_column_files[tablet_id];
+    for (const auto& dcg : dcgs) {
+        files.insert(dcg->column_file());
+    }
+    return Status::OK();
+}
+
+static bool is_useful_delta_column_files(std::unordered_set<std::string>& useful_files, const std::string& fullpath) {
+    std::filesystem::path path(fullpath);
+    return useful_files.count(path.filename().string()) > 0;
+}
+
 void DataDir::perform_path_gc_by_rowsetid() {
     // init the set of valid path
     // validate the path in data dir
@@ -460,6 +480,7 @@ void DataDir::perform_path_gc_by_rowsetid() {
         return;
     }
     LOG(INFO) << "start to path gc by rowsetid.";
+    std::unordered_map<int64_t, std::unordered_set<std::string>> delta_column_files;
     int counter = 0;
     for (auto& path : _all_check_paths) {
         ++counter;
@@ -473,6 +494,11 @@ void DataDir::perform_path_gc_by_rowsetid() {
             LOG(WARNING) << "unknown path:" << path;
             continue;
         }
+        auto st = scan_useful_delta_column_files(tablet_id, delta_column_files);
+        if (!st.ok()) {
+            LOG(WARNING) << "scan_useful_delta_column_files failed: " << st;
+            continue;
+        }
         if (tablet_id > 0 && schema_hash > 0) {
             // tablet schema hash path or rowset file path
             // gc thread should get tablet include deleted tablet
@@ -483,7 +509,8 @@ void DataDir::perform_path_gc_by_rowsetid() {
                 TabletSharedPtr tablet = _tablet_manager->get_tablet(tablet_id, false);
                 if (tablet != nullptr) {
                     if (!tablet->check_rowset_id(rowset_id) &&
-                        !StorageEngine::instance()->check_rowset_id_in_unused_rowsets(rowset_id)) {
+                        !StorageEngine::instance()->check_rowset_id_in_unused_rowsets(rowset_id) &&
+                        !is_useful_delta_column_files(delta_column_files[tablet_id], path)) {
                         _process_garbage_path(path);
                     }
                 }
@@ -541,12 +568,6 @@ void DataDir::perform_path_scan() {
                         continue;
                     }
                     for (const auto& rowset_file : rowset_files) {
-                        StringPiece sp(rowset_file);
-                        if (sp.ends_with(".cols")) {
-                            // ".col" isn't gc here, because it links with delta column group,
-                            // So it will be removed when delta column group is removed from rocksdb
-                            continue;
-                        }
                         std::string rowset_file_path = tablet_schema_hash_path + "/" + rowset_file;
                         _all_check_paths.insert(rowset_file_path);
                     }

@@ -136,6 +136,9 @@ public:
 
     Status update_capacity();
 
+    Status scan_useful_delta_column_files(
+            int64_t tablet_id, std::unordered_map<int64_t, std::unordered_set<std::string>>& delta_column_files);
+
 private:
     Status _init_data_dir();
     Status _init_tmp_dir();
