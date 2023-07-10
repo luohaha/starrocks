@@ -404,6 +404,7 @@ public class DatabaseTransactionMgr {
         if (transactionState.getTransactionStatus() == TransactionStatus.ABORTED) {
             throw new TransactionCommitFailedException(transactionState.getReason());
         }
+        transactionState.setTabletCommitInfos(tabletCommitInfos);
         VisibleStateWaiter waiter = new VisibleStateWaiter(transactionState);
         if (transactionState.getTransactionStatus() == TransactionStatus.VISIBLE) {
             LOG.debug("transaction is already visible: {}", transactionId);
@@ -965,6 +966,11 @@ public class DatabaseTransactionMgr {
                                         && replica.getLastFailedVersion() < 0) {
                                     // if replica not in can load state, skip it.
                                     if (!replica.getState().canLoad()) {
+                                        continue;
+                                    }
+                                    // if replica not commit yet, skip it. This may happen when it's just create by clone.
+                                    if (transactionState.tabletCommitInfosNotContainsReplica(tablet.getId(), 
+                                            replica.getBackendId())) {
                                         continue;
                                     }
                                     // this means the replica is a healthy replica,
