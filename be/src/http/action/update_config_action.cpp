@@ -104,6 +104,10 @@ Status UpdateConfigAction::update_config(const std::string& name, const std::str
             StorageEngine::instance()->increase_update_compaction_thread(
                     config::update_compaction_num_threads_per_disk);
         });
+        _config_callback.emplace("pindex_bg_compaction_num_threads_per_disk", [&]() {
+            StorageEngine::instance()->increase_pk_index_bg_compaction_thread(
+                    config::pindex_bg_compaction_num_threads_per_disk);
+        });
         _config_callback.emplace("update_memory_limit_percent", [&]() {
             StorageEngine::instance()->update_manager()->update_primary_index_memory_limit(
                     config::update_memory_limit_percent);

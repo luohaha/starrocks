@@ -192,6 +192,8 @@ public:
     void get_tablets_basic_infos(int64_t table_id, int64_t partition_id, int64_t tablet_id,
                                  std::vector<TabletBasicInfo>& tablet_infos);
 
+    TabletSharedPtr find_best_tablet_to_do_pk_index_bg_compaction(DataDir* data_dir);
+
 private:
     using TabletMap = std::unordered_map<int64_t, TabletSharedPtr>;
     using TabletSet = std::unordered_set<int64_t>;

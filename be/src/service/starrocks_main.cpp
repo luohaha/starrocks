@@ -192,7 +192,7 @@ int main(int argc, char** argv) {
         aws_sdk_options.loggingOptions.logLevel = level;
     }
     if (starrocks::config::aws_sdk_enable_compliant_rfc3986_encoding) {
-        aws_sdk_options.httpOptions.compliantRfc3986Encoding = true;
+        //aws_sdk_options.httpOptions.compliantRfc3986Encoding = true;
     }
     Aws::InitAPI(aws_sdk_options);
 

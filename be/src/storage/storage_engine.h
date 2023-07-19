@@ -255,6 +255,8 @@ public:
 
     void increase_update_compaction_thread(const int num_threads_per_disk);
 
+    void increase_pk_index_bg_compaction_thread(const int num_threads_per_disk);
+
     Status get_next_increment_id_interval(int64_t tableid, size_t num_row, std::vector<int64_t>& ids);
 
     void remove_increment_map_by_table_id(int64_t table_id);
@@ -324,6 +326,8 @@ private:
     void* _repair_compaction_thread_callback(void* arg);
     // manual compaction function
     void* _manual_compaction_thread_callback(void* arg);
+    // pk index bg compaction function
+    void* _pk_index_bg_compaction_thread_callback(void* arg, DataDir* data_dir);
 
     bool _check_and_run_manual_compaction_task();
 
@@ -349,6 +353,7 @@ private:
     Status _perform_cumulative_compaction(DataDir* data_dir, std::pair<int32_t, int32_t> tablet_shards_range);
     Status _perform_base_compaction(DataDir* data_dir, std::pair<int32_t, int32_t> tablet_shards_range);
     Status _perform_update_compaction(DataDir* data_dir);
+    Status _perform_pk_index_bg_compaction(DataDir* data_dir);
     Status _start_trash_sweep(double* usage);
     void _start_disk_stat_monitor();
 
@@ -387,6 +392,8 @@ private:
     std::vector<std::pair<int64_t, std::vector<uint32_t>>> _repair_compaction_tasks;
     std::vector<std::pair<int64_t, std::vector<std::pair<uint32_t, std::string>>>> _executed_repair_compaction_tasks;
     std::vector<std::thread> _manual_compaction_threads;
+    // threads to run pk index bg compaction
+    std::vector<std::thread> _pk_index_bg_compaction_threads;
     // threads to clean all file descriptor not actively in use
     std::thread _fd_cache_clean_thread;
     std::thread _adjust_cache_thread;

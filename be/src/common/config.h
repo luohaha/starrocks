@@ -941,6 +941,10 @@ CONF_mInt64(l0_max_mem_usage, "67108864");  // 64MB
 CONF_mInt64(l0_snapshot_size, "16777216"); // 16MB
 CONF_mInt64(max_tmp_l1_num, "10");
 CONF_mBool(enable_parallel_get_and_bf, "true");
+CONF_mBool(enable_pindex_async_compaction, "true");
+// if l2 num is larger than this, stop doing async compaction
+CONF_mInt64(max_allow_pindex_l2_num, "5");
+CONF_mInt64(pindex_bg_compaction_num_threads_per_disk, "2");
 
 // Used by query cache, cache entries are evicted when it exceeds its capacity(500MB in default)
 CONF_Int64(query_cache_capacity, "536870912");

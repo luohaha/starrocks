@@ -626,6 +626,44 @@ TabletSharedPtr TabletManager::find_best_tablet_to_compaction(CompactionType com
     return best_tablet;
 }
 
+TabletSharedPtr TabletManager::find_best_tablet_to_do_pk_index_bg_compaction(DataDir* data_dir) {
+    // best_score is the smallest score in tablet
+    double best_score = std::numeric_limits<double>::max();
+    TabletSharedPtr best_tablet;
+    for (const auto& tablets_shard : _tablets_shards) {
+        std::shared_lock rlock(tablets_shard.lock);
+        for (const auto& [tablet_id, tablet_ptr] : tablets_shard.tablet_map) {
+            if (tablet_ptr->keys_type() != PRIMARY_KEYS) {
+                continue;
+            }
+            // A not-ready tablet maybe a newly created tablet under schema-change, skip it
+            if (tablet_ptr->tablet_state() == TABLET_NOTREADY) {
+                continue;
+            }
+
+            if (tablet_ptr->data_dir()->path_hash() != data_dir->path_hash()) {
+                continue;
+            }
+
+            double score = tablet_ptr->updates()->get_pk_index_write_amp_score();
+            if (score <= 0) {
+                // score == 0 means this tablet's pk index doesn't need bg compaction
+                continue;
+            }
+
+            if (score < best_score) {
+                best_score = score;
+                best_tablet = tablet_ptr;
+            }
+        }
+    }
+    if (best_tablet != nullptr) {
+        LOG(INFO) << fmt::format("found tablet {} to do pk index bg compaction, which score is {}",
+                                 best_tablet->tablet_id(), best_score);
+    }
+    return best_tablet;
+}
+
 TabletSharedPtr TabletManager::find_best_tablet_to_do_update_compaction(DataDir* data_dir) {
     int64_t highest_score = 0;
     TabletSharedPtr best_tablet;

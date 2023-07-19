@@ -197,6 +197,18 @@ Status StorageEngine::start_bg_threads() {
     _repair_compaction_thread = std::thread([this] { _repair_compaction_thread_callback(nullptr); });
     Thread::set_thread_name(_repair_compaction_thread, "repair_compact");
 
+    int32_t pk_index_bg_compaction_num_threads_per_disk = config::pindex_bg_compaction_num_threads_per_disk >= 1
+                                                                  ? config::pindex_bg_compaction_num_threads_per_disk
+                                                                  : 1;
+    int32_t pk_index_bg_compaction_num_threads = pk_index_bg_compaction_num_threads_per_disk * data_dir_num;
+    _pk_index_bg_compaction_threads.reserve(pk_index_bg_compaction_num_threads);
+    for (uint32_t i = 0; i < pk_index_bg_compaction_num_threads; ++i) {
+        _pk_index_bg_compaction_threads.emplace_back([this, data_dir_num, data_dirs, i] {
+            _pk_index_bg_compaction_thread_callback(nullptr, data_dirs[i % data_dir_num]);
+        });
+        Thread::set_thread_name(_pk_index_bg_compaction_threads.back(), "pk_index_compact");
+    }
+
     for (uint32_t i = 0; i < config::manual_compaction_threads; i++) {
         _manual_compaction_threads.emplace_back([this] { _manual_compaction_thread_callback(nullptr); });
         Thread::set_thread_name(_manual_compaction_threads.back(), "manual_compact");
@@ -368,6 +380,29 @@ void* StorageEngine::_base_compaction_thread_callback(void* arg, DataDir* data_d
                 break;
             }
         } while (true);
+    }
+
+    return nullptr;
+}
+
+void* StorageEngine::_pk_index_bg_compaction_thread_callback(void* arg, DataDir* data_dir) {
+#ifdef GOOGLE_PROFILER
+    ProfilerRegisterThread();
+#endif
+    Status status = Status::OK();
+    while (!_bg_worker_stopped.load(std::memory_order_consume)) {
+        // must be here, because this thread is start on start and
+        if (!data_dir->capacity_limit_reached(0)) {
+            status = _perform_pk_index_bg_compaction(data_dir);
+        } else {
+            status = Status::InternalError("data dir out of capacity");
+        }
+        if (status.ok()) {
+            continue;
+        }
+
+        // sleep 3s if pick tablet to do pk index compaction fail
+        sleep(3);
     }
 
     return nullptr;

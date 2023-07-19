@@ -594,6 +594,8 @@ void StorageEngine::stop() {
     JOIN_THREADS(_manual_compaction_threads)
     JOIN_THREADS(_tablet_checkpoint_threads)
 
+    JOIN_THREADS(_pk_index_bg_compaction_threads);
+
     JOIN_THREAD(_fd_cache_clean_thread)
     JOIN_THREAD(_adjust_cache_thread)
 
@@ -896,6 +898,17 @@ Status StorageEngine::_perform_base_compaction(DataDir* data_dir, std::pair<int3
 
     best_tablet->set_last_base_compaction_failure_time(0);
     return Status::OK();
+}
+
+Status StorageEngine::_perform_pk_index_bg_compaction(DataDir* data_dir) {
+    TabletSharedPtr best_tablet = _tablet_manager->find_best_tablet_to_do_pk_index_bg_compaction(data_dir);
+    if (best_tablet == nullptr) {
+        return Status::NotFound("there are no suitable tablets");
+    }
+    if (best_tablet->updates() == nullptr) {
+        return Status::InternalError("not an updatable tablet");
+    }
+    return best_tablet->updates()->pk_index_bg_compaction();
 }
 
 Status StorageEngine::_perform_update_compaction(DataDir* data_dir) {
@@ -1309,6 +1322,26 @@ void StorageEngine::increase_update_compaction_thread(const int num_threads_per_
             _update_compaction_thread_callback(nullptr, data_dirs[i % data_dir_num]);
         });
         Thread::set_thread_name(_update_compaction_threads.back(), "update_compact");
+    }
+}
+
+void StorageEngine::increase_pk_index_bg_compaction_thread(const int num_threads_per_disk) {
+    std::vector<DataDir*> data_dirs;
+    for (auto& tmp_store : _store_map) {
+        data_dirs.push_back(tmp_store.second);
+    }
+    const auto data_dir_num = static_cast<int32_t>(data_dirs.size());
+    const int32_t cur_threads_per_disk = _pk_index_bg_compaction_threads.size() / data_dir_num;
+    if (num_threads_per_disk <= cur_threads_per_disk) {
+        LOG(WARNING) << fmt::format("not support decrease pk index bg compaction thread, from {} to {}",
+                                    cur_threads_per_disk, num_threads_per_disk);
+        return;
+    }
+    for (uint32_t i = 0; i < data_dir_num * (num_threads_per_disk - cur_threads_per_disk); ++i) {
+        _pk_index_bg_compaction_threads.emplace_back([this, data_dir_num, data_dirs, i] {
+            _pk_index_bg_compaction_thread_callback(nullptr, data_dirs[i % data_dir_num]);
+        });
+        Thread::set_thread_name(_pk_index_bg_compaction_threads.back(), "pk_index_compact");
     }
 }
 
