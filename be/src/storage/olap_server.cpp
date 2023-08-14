@@ -385,10 +385,11 @@ void* StorageEngine::_update_compaction_thread_callback(void* arg, DataDir* data
         } else {
             status = Status::InternalError("data dir out of capacity");
         }
-        if (status.ok()) {
+        if (!status.is_mem_limit_exceeded()) {
             continue;
         }
 
+        // if memory limit exceed, sleep and retry
         int32_t interval = config::update_compaction_check_interval_seconds;
         if (interval <= 0) {
             LOG(WARNING) << "update compaction check interval config is illegal: " << interval << ", force set to 1";
