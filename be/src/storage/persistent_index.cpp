@@ -623,6 +623,7 @@ Status ImmutableIndexWriter::finish() {
             "finish writing immutable index $0 #shard:$1 #kv:$2 #moved:$3($4) kv_bytes:$5 usage:$6 bf_bytes:$7",
             _idx_file_path_tmp, _nshard, _total, _total_moved, _total_moved * 1000 / std::max(_total, 1UL) / 1000.0,
             _total_kv_bytes, _total_kv_size * 1000 / std::max(_total_kv_bytes, 1UL) / 1000.0, _total_bf_bytes);
+    int64_t t_debug1 = MonotonicMillis();
     _version.to_pb(_meta.mutable_version());
     _meta.set_size(_total);
     _meta.set_format_version(PERSISTENT_INDEX_VERSION_3);
@@ -637,17 +638,25 @@ Status ImmutableIndexWriter::finish() {
     if (!_meta.SerializeToString(&footer)) {
         return Status::InternalError("ImmutableIndexMetaPB::SerializeToString failed");
     }
+    int64_t t_debug2 = MonotonicMillis();
     put_fixed32_le(&footer, static_cast<uint32_t>(footer.size()));
     uint32_t checksum = crc32c::Value(footer.data(), footer.size());
+    int64_t t_debug3 = MonotonicMillis();
     put_fixed32_le(&footer, checksum);
     footer.append(kIndexFileMagic, 4);
     RETURN_IF_ERROR(_idx_wb->append(Slice(footer)));
     RETURN_IF_ERROR(_idx_wb->close());
+    int64_t t_debug4 = MonotonicMillis();
     RETURN_IF_ERROR(FileSystem::Default()->rename_file(_idx_file_path_tmp, _idx_file_path));
+    int64_t t_debug5 = MonotonicMillis();
     _idx_wb.reset();
     RETURN_IF_ERROR(_bf_wb->close());
     FileSystem::Default()->delete_file(_bf_file_path);
     _bf_wb.reset();
+    int64_t t_debug6 = MonotonicMillis();
+    LOG(INFO) << "finish writing immutable index " << _idx_file_path << " "
+              << strings::Substitute("duration($0/$1/$2/$3/$4)", t_debug2 - t_debug1, t_debug3 - t_debug2,
+                                     t_debug4 - t_debug3, t_debug5 - t_debug4, t_debug6 - t_debug5);
     return Status::OK();
 }
 
@@ -774,6 +783,7 @@ public:
             put_fixed64_le(&fixed_buf, value.get_value());
         }
         RETURN_IF_ERROR(index_file->append(fixed_buf));
+        RETURN_IF_ERROR(index_file->sync());
         *page_size += fixed_buf.size();
         return Status::OK();
     }
@@ -1098,6 +1108,7 @@ public:
             put_fixed64_le(&fixed_buf, value.get_value());
         }
         RETURN_IF_ERROR(index_file->append(fixed_buf));
+        RETURN_IF_ERROR(index_file->sync());
         *page_size += fixed_buf.size();
         return Status::OK();
     }
@@ -1818,6 +1829,7 @@ Status ShardByLengthMutableIndex::commit(MutableIndexMetaPB* meta, const EditVer
         // dump snapshot success, set _index_file to new snapshot file
         WritableFileOptions wblock_opts;
         wblock_opts.mode = FileSystem::MUST_EXIST;
+        wblock_opts.sync_on_close = false;
         ASSIGN_OR_RETURN(_index_file, fs->new_writable_file(wblock_opts, file_name));
         size_t snapshot_size = _index_file->size();
         meta->clear_wals();
@@ -1900,6 +1912,7 @@ Status ShardByLengthMutableIndex::load(const MutableIndexMetaPB& meta) {
     RETURN_IF_ERROR(FileSystemUtil::resize_file(index_file_name, _offset));
     WritableFileOptions wblock_opts;
     wblock_opts.mode = FileSystem::MUST_EXIST;
+    wblock_opts.sync_on_close = false;
     ASSIGN_OR_RETURN(_index_file, fs->new_writable_file(wblock_opts, index_file_name));
     return Status::OK();
 }
@@ -2770,6 +2783,7 @@ Status PersistentIndex::load(const PersistentIndexMetaPB& index_meta) {
 }
 
 Status PersistentIndex::_load(const PersistentIndexMetaPB& index_meta, bool reload) {
+    int64_t t_debug1 = MonotonicMillis();
     size_t key_size = index_meta.key_size();
     _size = index_meta.size();
     if (_size != 0 && index_meta.usage() == 0) {
@@ -2810,6 +2824,7 @@ Status PersistentIndex::_load(const PersistentIndexMetaPB& index_meta, bool relo
     const MutableIndexMetaPB& l0_meta = index_meta.l0_meta();
     DCHECK(_l0 != nullptr);
     RETURN_IF_ERROR(_l0->load(l0_meta));
+    int64_t t_debug2 = MonotonicMillis();
     {
         std::unique_lock wrlock(_lock);
         _l1_vec.clear();
@@ -2834,6 +2849,7 @@ Status PersistentIndex::_load(const PersistentIndexMetaPB& index_meta, bool relo
             _has_l1 = true;
         }
     }
+    int64_t t_debug3 = MonotonicMillis();
     {
         std::unique_lock wrlock(_lock);
         _l2_versions.clear();
@@ -2886,6 +2902,10 @@ Status PersistentIndex::_load(const PersistentIndexMetaPB& index_meta, bool relo
             }
         }
     }
+    int64_t t_debug4 = MonotonicMillis();
+    LOG(INFO) << "PersistentIndex::_load path: " << _path << " "
+              << strings::Substitute("duration:($0/$1/$2)", t_debug2 - t_debug1, t_debug3 - t_debug2,
+                                     t_debug4 - t_debug3);
 
     return Status::OK();
 }
@@ -3791,7 +3811,9 @@ Status PersistentIndex::_reload(const PersistentIndexMetaPB& index_meta) {
     if (!l0_st.ok()) {
         return l0_st.status();
     }
+    LOG(INFO) << "PersistentIndex::_reload " << _path;
     _l0 = std::move(l0_st).value();
+    LOG(INFO) << "PersistentIndex::_reload2 " << _path;
     Status st = _load(index_meta, true);
     if (!st.ok()) {
         LOG(WARNING) << "reload persistent index failed, status: " << st.to_string();
@@ -4352,8 +4374,8 @@ Status PersistentIndex::_minor_compaction(PersistentIndexMetaPB* index_meta) {
                 strings::Substitute("$0/index.l2.$1.$2", _path, _l1_version.major_number(), _l1_version.minor_number());
         const std::string old_l1_file_path =
                 strings::Substitute("$0/index.l1.$1.$2", _path, _l1_version.major_number(), _l1_version.minor_number());
-        LOG(INFO) << "PersistentIndex minor compaction, link from " << old_l1_file_path << " to " << l2_file_path;
         RETURN_IF_ERROR(FileSystem::Default()->link_file(old_l1_file_path, l2_file_path));
+        LOG(INFO) << "PersistentIndex minor compaction, link from " << old_l1_file_path << " to " << l2_file_path;
         _l1_version.to_pb(index_meta->add_l2_versions());
         index_meta->add_l2_version_merged(false);
     }
@@ -4365,6 +4387,7 @@ Status PersistentIndex::_minor_compaction(PersistentIndexMetaPB* index_meta) {
     _version.to_pb(index_meta->mutable_l1_version());
     MutableIndexMetaPB* l0_meta = index_meta->mutable_l0_meta();
     RETURN_IF_ERROR(_l0->commit(l0_meta, _version, need_snapshot ? kSnapshot : kFlush));
+    LOG(INFO) << "PersistentIndex l0 commit path: " << _path;
     return Status::OK();
 }
 
@@ -4655,12 +4678,14 @@ Status PersistentIndex::major_compaction(Tablet* tablet) {
     }
     DeferOp defer([&]() { _major_compaction_running.store(false); });
     // merge all l2 files
+    int64_t t_begin = MonotonicMillis();
     PersistentIndexMetaPB prev_index_meta;
     RETURN_IF_ERROR(
             TabletMetaManager::get_persistent_index_meta(tablet->data_dir(), tablet->tablet_id(), &prev_index_meta));
     if (prev_index_meta.l2_versions_size() <= 1) {
         return Status::OK();
     }
+    int64_t t_get_meta = MonotonicMillis();
     // 1. load current l2 vec
     std::vector<EditVersion> l2_versions;
     std::vector<std::unique_ptr<ImmutableIndex>> l2_vec;
@@ -4675,6 +4700,7 @@ Status PersistentIndex::major_compaction(Tablet* tablet) {
     }
     // 2. merge l2 files to new l2 file
     ASSIGN_OR_RETURN(EditVersion new_l2_version, _major_compaction_impl(l2_versions, l2_vec));
+    int64_t t_do_compact = MonotonicMillis();
     // 3. modify PersistentIndexMetaPB and make this step atomic.
     std::lock_guard<std::mutex> guard(_meta_lock);
     PersistentIndexMetaPB index_meta;
@@ -4682,6 +4708,10 @@ Status PersistentIndex::major_compaction(Tablet* tablet) {
     modify_l2_versions(l2_versions, new_l2_version, index_meta);
     RETURN_IF_ERROR(
             TabletMetaManager::write_persistent_index_meta(tablet->data_dir(), tablet->tablet_id(), index_meta));
+    int64_t t_write_meta = MonotonicMillis();
+    LOG(INFO) << "major_compaction path: " << _path << " "
+              << strings::Substitute("duration: ($0/$1/$2)", t_get_meta - t_begin, t_do_compact - t_get_meta,
+                                     t_write_meta - t_do_compact);
     return Status::OK();
 }
 

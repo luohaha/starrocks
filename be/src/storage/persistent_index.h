@@ -250,6 +250,12 @@ public:
         }
     }
 
+    void sync_index_file() {
+        if (_index_file) {
+            _index_file->sync();
+        }
+    }
+
     // batch get
     // |n|: size of key/value array
     // |keys|: key array as raw buffer

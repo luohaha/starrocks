@@ -1932,6 +1932,7 @@ void TabletUpdates::_apply_compaction_commit(const EditVersionInfo& version_info
     _compaction_state.reset();
     int64_t t_index_delvec = MonotonicMillis();
 
+    int64_t t_debug1 = MonotonicMillis();
     PersistentIndexMetaPB index_meta;
     PersistentIndexMetaLockGuard index_meta_lock_guard;
     if (enable_persistent_index) {
@@ -1944,6 +1945,7 @@ void TabletUpdates::_apply_compaction_commit(const EditVersionInfo& version_info
             return;
         }
     }
+    int64_t t_debug2 = MonotonicMillis();
     st = index.commit(&index_meta);
     if (!st.ok()) {
         std::string msg = strings::Substitute("primary index commit failed: $0", st.to_string());
@@ -1951,6 +1953,7 @@ void TabletUpdates::_apply_compaction_commit(const EditVersionInfo& version_info
         _set_error(msg);
         return;
     }
+    int64_t t_debug3 = MonotonicMillis();
 
     {
         std::lock_guard wl(_lock);
@@ -2029,7 +2032,9 @@ void TabletUpdates::_apply_compaction_commit(const EditVersionInfo& version_info
               << _cur_total_rows << " " << del_percent << "%"
               << " rowset:" << rowset_id << " #row:" << total_rows << " #del:" << total_deletes
               << " #delvec:" << delvecs.size() << " duration:" << t_write - t_start << "ms"
-              << strings::Substitute("($0/$1/$2)", t_load - t_start, t_index_delvec - t_load, t_write - t_index_delvec);
+              << strings::Substitute("($0/$1/$2/$3/$4/$5)", t_load - t_start, t_index_delvec - t_load,
+                                     t_write - t_index_delvec, t_debug2 - t_debug1, t_debug3 - t_debug2,
+                                     t_write - t_debug3);
     VLOG(1) << "update compaction apply " << _debug_string(true, true);
     if (row_before != row_after) {
         string msg = strings::Substitute("actual row size changed after compaction $0 -> $1", row_before, row_after);
