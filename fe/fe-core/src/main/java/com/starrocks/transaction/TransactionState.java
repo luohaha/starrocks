@@ -331,6 +331,7 @@ public class TransactionState implements Writable {
     private long checkerCreationTime = 0;
     private Span txnSpan = null;
     private String traceParent = null;
+    @SerializedName("tci")
     private Set<TabletCommitInfo> tabletCommitInfos = null;
 
     public TransactionState() {
