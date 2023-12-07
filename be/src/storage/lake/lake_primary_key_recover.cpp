@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "storage/lake/primary_key_recover.h"
+#include "storage/lake/lake_primary_key_recover.h"
 
 #include "column/column.h"
 #include "common/constexpr.h"
@@ -27,7 +27,7 @@
 
 namespace starrocks::lake {
 
-Status PrimaryKeyRecover::pre_cleanup() {
+Status LakePrimaryKeyRecover::pre_cleanup() {
     // 1. reset delvec in metadata and clean delvec in builder
     // TODO reclaim delvec files
     _metadata->clear_delvec_meta();
@@ -44,87 +44,47 @@ Status PrimaryKeyRecover::pre_cleanup() {
     return Status::OK();
 }
 
-Status PrimaryKeyRecover::_init_schema(const TabletMetadata& metadata) {
-    std::shared_ptr<TabletSchema> tablet_schema = std::make_shared<TabletSchema>(metadata.schema());
+// Primary key schema
+starrocks::Schema LakePrimaryKeyRecover::generate_pkey_schema() {
+    std::shared_ptr<TabletSchema> tablet_schema = std::make_shared<TabletSchema>(_metadata->schema());
     std::vector<ColumnId> pk_columns(tablet_schema->num_key_columns());
     for (auto i = 0; i < tablet_schema->num_key_columns(); i++) {
         pk_columns[i] = (ColumnId)i;
     }
-    _pkey_schema = ChunkHelper::convert_schema(tablet_schema, pk_columns);
-
-    if (pk_columns.size() > 1) {
-        // more than one key column
-        if (!PrimaryKeyEncoder::create_column(_pkey_schema, &_pk_column).ok()) {
-            CHECK(false) << "create column for primary key encoder failed";
-        }
-    }
-    return Status::OK();
+    return ChunkHelper::convert_schema(tablet_schema, pk_columns);
 }
 
-Status PrimaryKeyRecover::recover() {
-    // 1. build schema
-    RETURN_IF_ERROR(_init_schema(*_metadata));
-    // For simplicity, we use temp pk index for generate delvec, and then rebuild real pk index when retry publish
-    LakePrimaryIndex index(_pkey_schema);
-
-    OlapReaderStatistics stats;
-    std::vector<uint32_t> rowids;
-    rowids.reserve(DEFAULT_CHUNK_SIZE);
-    PrimaryIndex::DeletesMap new_deletes;
-    auto chunk_shared_ptr = ChunkHelper::new_chunk(_pkey_schema, DEFAULT_CHUNK_SIZE);
-    auto chunk = chunk_shared_ptr.get();
-    // 2. scan all rowsets and segments to build primary index
+// get next segment iterator and its rssid, return EOF when finish
+StatusOr<RssIDToSegmentIters> LakePrimaryKeyRecover::get_segment_iterators(OlapReaderStatistics& stats) {
     auto rowsets = _tablet->get_rowsets(*_metadata);
     if (!rowsets.ok()) {
         return rowsets.status();
     }
-    // 3. rebuild primary key index and generate delete maps
+    // iter and rssid list
+    RssIDToSegmentIters rssid_iters;
     for (auto& rowset : *rowsets) {
         auto res = rowset->get_each_segment_iterator(_pkey_schema, &stats);
         if (!res.ok()) {
             return res.status();
         }
         auto& itrs = res.value();
-        CHECK(itrs.size() == rowset->num_segments()) << "itrs.size != num_segments";
-        for (size_t i = 0; i < itrs.size(); i++) {
-            auto itr = itrs[i].get();
-            uint32_t row_id_start = 0;
-            if (itr == nullptr) {
-                continue;
-            }
-            while (true) {
-                chunk->reset();
-                rowids.clear();
-                auto st = itr->get_next(chunk, &rowids);
-                if (st.is_end_of_file()) {
-                    break;
-                } else if (!st.ok()) {
-                    return st;
-                } else {
-                    Column* pkc = nullptr;
-                    if (_pk_column) {
-                        _pk_column->reset_column();
-                        PrimaryKeyEncoder::encode(_pkey_schema, *chunk, 0, chunk->num_rows(), _pk_column.get());
-                        pkc = _pk_column.get();
-                    } else {
-                        pkc = chunk->columns()[0].get();
-                    }
-                    // upsert and generate new deletes
-                    RETURN_IF_ERROR(index.upsert(rowset->id() + i, row_id_start, *pkc, &new_deletes));
-                    row_id_start += pkc->size();
-                }
-            }
-            itr->close();
+        for (int i = 0; i < itrs.size(); i++) {
+            const auto& itr = itrs[i];
+            if (itr == nullptr) continue;
+            rssid_iters.push_back(std::make_pair(rowset->id() + i, itr));
         }
     }
-    // 4. generate delvec and add them to builder
+    return rssid_iters;
+}
+
+// generate delvec and save
+Status LakePrimaryKeyRecover::finalize_delvec(const PrimaryIndex::DeletesMap& new_deletes) {
     for (auto& new_delete : new_deletes) {
         auto delvec_ptr = std::make_shared<DelVector>();
         auto& del_ids = new_delete.second;
         delvec_ptr->init(_metadata->version(), del_ids.data(), del_ids.size());
         _builder->append_delvec(delvec_ptr, new_delete.first);
     }
-
     return Status::OK();
 }
 
