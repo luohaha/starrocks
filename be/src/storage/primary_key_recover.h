@@ -43,7 +43,7 @@ class PrimaryKeyRecover {
 public:
     // Follow the steps below:
     // 1. reset_state
-    // 2. rebuild
+    // 2. recover
     //
     // clean up delvec and primary index
     virtual Status pre_cleanup() = 0;

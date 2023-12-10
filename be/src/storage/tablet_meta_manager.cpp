@@ -858,6 +858,21 @@ Status TabletMetaManager::rowset_iterate(DataDir* store, TTabletId tablet_id, co
                                       });
 }
 
+Status TabletMetaManager::write_delvecs(const vector<std::pair<uint32_t, DelVectorPtr>>& delvecs, TTabletId tablet_id,
+                                        rocksdb::WriteBatch* wb) {
+    TabletSegmentId tsid;
+    tsid.tablet_id = tablet_id;
+    int64_t total_bytes = 0;
+    for (auto& rssid_delvec : delvecs) {
+        tsid.segment_id = rssid_delvec.first;
+        auto dv_key = encode_del_vector_key(tsid.tablet_id, tsid.segment_id, version.major_number());
+        auto dv_value = rssid_delvec.second->save();
+        total_bytes += dv_value.size();
+        st = wb->Put(handle, dv_key, dv_value);
+    }
+    return Status::OK();
+}
+
 Status TabletMetaManager::apply_rowset_commit(DataDir* store, TTabletId tablet_id, int64_t logid,
                                               const EditVersion& version,
                                               vector<std::pair<uint32_t, DelVectorPtr>>& delvecs,
