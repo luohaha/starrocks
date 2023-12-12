@@ -45,7 +45,8 @@ public:
     starrocks::Schema generate_pkey_schema() override;
 
     // get next segment iterator and its rssid, return EOF when finish
-    StatusOr<RssIDToSegmentIters> get_segment_iterators(OlapReaderStatistics& stats) override;
+    StatusOr<RssIDToSegmentIters> get_segment_iterators(const starrocks::Schema& pkey_schema,
+                                                        OlapReaderStatistics& stats) override;
 
     // generate delvec and save
     Status finalize_delvec(const PrimaryIndex::DeletesMap& new_deletes) override;
@@ -55,7 +56,6 @@ private:
     Tablet* _tablet;
     TabletMetadata* _metadata;
     std::unique_ptr<Column> _pk_column;
-    starrocks::Schema _pkey_schema;
 };
 
 } // namespace lake

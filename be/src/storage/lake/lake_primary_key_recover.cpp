@@ -55,7 +55,8 @@ starrocks::Schema LakePrimaryKeyRecover::generate_pkey_schema() {
 }
 
 // get next segment iterator and its rssid, return EOF when finish
-StatusOr<RssIDToSegmentIters> LakePrimaryKeyRecover::get_segment_iterators(OlapReaderStatistics& stats) {
+StatusOr<RssIDToSegmentIters> LakePrimaryKeyRecover::get_segment_iterators(const starrocks::Schema& pkey_schema,
+                                                                           OlapReaderStatistics& stats) {
     auto rowsets = _tablet->get_rowsets(*_metadata);
     if (!rowsets.ok()) {
         return rowsets.status();
@@ -63,7 +64,7 @@ StatusOr<RssIDToSegmentIters> LakePrimaryKeyRecover::get_segment_iterators(OlapR
     // iter and rssid list
     RssIDToSegmentIters rssid_iters;
     for (auto& rowset : *rowsets) {
-        auto res = rowset->get_each_segment_iterator(_pkey_schema, &stats);
+        auto res = rowset->get_each_segment_iterator(pkey_schema, &stats);
         if (!res.ok()) {
             return res.status();
         }

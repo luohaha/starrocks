@@ -40,7 +40,7 @@ Status PrimaryKeyRecover::recover() {
     auto chunk_shared_ptr = ChunkHelper::new_chunk(pkey_schema, DEFAULT_CHUNK_SIZE);
     auto chunk = chunk_shared_ptr.get();
     // 2. scan all rowsets and segments to build primary index
-    auto res = get_segment_iterators(stats);
+    auto res = get_segment_iterators(pkey_schema, stats);
     if (!res.ok()) {
         return res.status();
     }

@@ -172,6 +172,7 @@ add_library(Storage STATIC
     cluster_id_mgr.cpp
     push_utils.cpp
     primary_key_recover.cpp
+    local_primary_key_recover.cpp
     lake/async_delta_writer.cpp
     lake/compaction_policy.cpp
     lake/compaction_scheduler.cpp

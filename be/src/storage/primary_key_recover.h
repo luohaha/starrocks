@@ -52,7 +52,7 @@ public:
     virtual starrocks::Schema generate_pkey_schema() = 0;
 
     // get segment iterator list and its rssid
-    virtual StatusOr<RssIDToSegmentIters> get_segment_iterators(OlapReaderStatistics& stats) = 0;
+    virtual StatusOr<RssIDToSegmentIters> get_segment_iterators(const starrocks::Schema& pkey_schema, OlapReaderStatistics& stats) = 0;
 
     // generate delvec and save
     virtual Status finalize_delvec(const PrimaryIndex::DeletesMap& new_deletes) = 0;

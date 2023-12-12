@@ -14,6 +14,10 @@
 
 #include "storage/local_primary_key_recover.h"
 
+#include "storage/chunk_helper.h"
+#include "storage/tablet_meta_manager.h"
+#include "storage/update_manager.h"
+
 namespace starrocks {
 
 Status LocalPrimaryKeyRecover::pre_cleanup() {
@@ -23,7 +27,7 @@ Status LocalPrimaryKeyRecover::pre_cleanup() {
         _update_mgr->index_cache().remove(index_entry);
     }
     // delete persistent index meta
-    if (_tablet.get_enable_persistent_index()) {
+    if (_tablet->get_enable_persistent_index()) {
         RETURN_IF_ERROR(TabletMetaManager::clear_persistent_index(_tablet->data_dir(), &_wb, _tablet->tablet_id()));
     }
     // 2. remove delvec
@@ -40,17 +44,19 @@ starrocks::Schema LocalPrimaryKeyRecover::generate_pkey_schema() {
 }
 
 // get segment iterator list and its rssid
-StatusOr<RssIDToSegmentIters> LocalPrimaryKeyRecover::get_segment_iterators(OlapReaderStatistics& stats) {
+StatusOr<RssIDToSegmentIters> LocalPrimaryKeyRecover::get_segment_iterators(const starrocks::Schema& pkey_schema,
+                                                                            OlapReaderStatistics& stats) {
     // iter and rssid list
     RssIDToSegmentIters rssid_iters;
     int64_t apply_version = 0;
     std::vector<RowsetSharedPtr> rowsets;
     std::vector<uint32_t> rowset_ids;
-    RETURN_IF_ERROR(tablet->updates()->get_apply_version_and_rowsets(&apply_version, &rowsets, &rowset_ids));
+    RETURN_IF_ERROR(_tablet->updates()->get_apply_version_and_rowsets(&apply_version, &rowsets, &rowset_ids));
     for (auto& rowset : rowsets) {
         // NOT acquire rowset reference because tbalet already in error state, rowset reclaim should stop
-        auto res = rowset->get_segment_iterators2(pkey_schema, tablet->tablet_schema(), tablet->data_dir()->get_meta(),
-                                                  apply_version, &stats);
+        // NOT apply delvec when create segment iterator
+        auto res =
+                rowset->get_segment_iterators2(pkey_schema, _tablet->tablet_schema(), nullptr, apply_version, &stats);
         if (!res.ok()) {
             return res.status();
         }
@@ -58,9 +64,8 @@ StatusOr<RssIDToSegmentIters> LocalPrimaryKeyRecover::get_segment_iterators(Olap
         // TODO(cbl): auto close iterators on failure
         CHECK(itrs.size() == rowset->num_segments()) << "itrs.size != num_segments";
         for (size_t i = 0; i < itrs.size(); i++) {
-            auto itr = itrs[i].get();
-            if (itr == nullptr) continue;
-            rssid_iters.push_back(std::make_pair(rowset->rowset_meta()->get_rowset_seg_id() + i, itr));
+            if (itrs[i].get() == nullptr) continue;
+            rssid_iters.emplace_back(rowset->rowset_meta()->get_rowset_seg_id() + (uint32_t)i, itrs[i]);
         }
     }
     return rssid_iters;
@@ -79,15 +84,18 @@ Status LocalPrimaryKeyRecover::finalize_delvec(const PrimaryIndex::DeletesMap& n
         new_del_vecs[idx].first = rssid;
         new_del_vecs[idx].second = std::make_shared<DelVector>();
         auto& del_ids = new_delete.second;
-        new_del_vecs[idx].second->init(version.major_number(), del_ids.data(), del_ids.size());
+        new_del_vecs[idx].second->init(_version.major_number(), del_ids.data(), del_ids.size());
         total_del += del_ids.size();
         idx++;
     }
     // put delvec into WriteBatch
-    
+    RETURN_IF_ERROR(TabletMetaManager::put_del_vectors(_tablet->data_dir(), &_wb, _tablet->tablet_id(), _version,
+                                                       new_del_vecs));
+    // sync to RocksDB
+    RETURN_IF_ERROR(_tablet->data_dir()->get_meta()->write_batch(&_wb));
     // put delvec in cache
     TabletSegmentId tsid;
-    tsid.tablet_id = tablet_id;
+    tsid.tablet_id = _tablet->tablet_id();
     for (auto& delvec_pair : new_del_vecs) {
         tsid.segment_id = delvec_pair.first;
         RETURN_IF_ERROR(_update_mgr->set_cached_del_vec(tsid, delvec_pair.second));
