@@ -98,6 +98,8 @@ Status LocalPrimaryKeyRecover::finalize_delvec(const PrimaryIndex::DeletesMap& n
     tsid.tablet_id = _tablet->tablet_id();
     for (auto& delvec_pair : new_del_vecs) {
         tsid.segment_id = delvec_pair.first;
+        // need to clear delvec first, so we can set new delvec successfully
+        _update_mgr->clear_cached_del_vec({tsid});
         RETURN_IF_ERROR(_update_mgr->set_cached_del_vec(tsid, delvec_pair.second));
     }
     return Status::OK();

@@ -99,6 +99,9 @@ Status StorageEngine::start_bg_threads() {
     _pk_index_major_compaction_thread = std::thread([this] { _pk_index_major_compaction_thread_callback(nullptr); });
     Thread::set_thread_name(_pk_index_major_compaction_thread, "pk_index_compaction_scheduler");
 
+    _pk_tablet_recover_thread = std::thread([this] { _pk_tablet_recover_callback(nullptr); });
+    Thread::set_thread_name(_pk_tablet_recover_thread, "pk_tablet_recover_thread");
+
 #ifdef USE_STAROS
     _local_pk_index_shard_data_gc_thread =
             std::thread([this] { _local_pk_index_shard_data_gc_thread_callback(nullptr); });
@@ -399,6 +402,22 @@ void* StorageEngine::_pk_index_major_compaction_thread_callback(void* arg) {
         SLEEP_IN_BG_WORKER(config::pindex_major_compaction_schedule_interval_seconds);
         // schedule persistent index compaction
         _update_manager->get_pindex_compaction_mgr()->schedule();
+    }
+
+    return nullptr;
+}
+
+// pk tablet recover function
+void* StorageEngine::_pk_tablet_recover_callback(void* arg) {
+#ifdef GOOGLE_PROFILER
+    ProfilerRegisterThread();
+#endif
+    while (!_bg_worker_stopped.load(std::memory_order_consume)) {
+        SLEEP_IN_BG_WORKER(60);
+        // recover tablet in error state
+        if (config::enable_primary_key_recover) {
+            _tablet_manager->primary_key_tablets_recover();
+        }
     }
 
     return nullptr;

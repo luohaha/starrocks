@@ -20,6 +20,10 @@
 namespace starrocks {
 
 Status PrimaryKeyRecover::recover() {
+    // 1. clean up old primary index and delvec
+    RETURN_IF_ERROR(pre_cleanup());
+
+    // 2. generate primary key schema
     std::unique_ptr<Column> pk_column;
     auto pkey_schema = generate_pkey_schema();
 
@@ -39,7 +43,7 @@ Status PrimaryKeyRecover::recover() {
     PrimaryIndex::DeletesMap new_deletes;
     auto chunk_shared_ptr = ChunkHelper::new_chunk(pkey_schema, DEFAULT_CHUNK_SIZE);
     auto chunk = chunk_shared_ptr.get();
-    // 2. scan all rowsets and segments to build primary index
+    // 3. scan all rowsets and segments to build primary index
     auto res = get_segment_iterators(pkey_schema, stats);
     if (!res.ok()) {
         return res.status();
@@ -73,6 +77,7 @@ Status PrimaryKeyRecover::recover() {
         itr->close();
     }
 
+    // 4. sync delete vector
     return finalize_delvec(new_deletes);
 }
 

@@ -618,6 +618,8 @@ void StorageEngine::stop() {
 
     JOIN_THREAD(_pk_index_major_compaction_thread)
 
+    JOIN_THREAD(_pk_tablet_recover_thread)
+
 #ifdef USE_STAROS
     JOIN_THREAD(_local_pk_index_shard_data_gc_thread)
 #endif

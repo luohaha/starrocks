@@ -116,7 +116,6 @@ private:
                 _index_entry = nullptr;
                 // rebuild delvec and pk index
                 LakePrimaryKeyRecover recover(&_builder, &_tablet, _metadata.get());
-                RETURN_IF_ERROR(recover.pre_cleanup());
                 RETURN_IF_ERROR(recover.recover());
                 LOG(INFO) << "Primary Key recover finish, tablet_id: " << _tablet.id()
                           << " base_ver: " << _base_version;

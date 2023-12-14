@@ -331,6 +331,9 @@ public:
     // get the max rowset creation time for largest major version
     int64_t max_rowset_creation_time();
 
+    // recover
+    Status recover();
+
 private:
     friend class Tablet;
     friend class PrimaryIndex;
