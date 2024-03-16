@@ -26,7 +26,7 @@ LakePersistentIndex::~LakePersistentIndex() {
     _memtable->clear();
 }
 
-Status LakePersistentIndex::get(size_t n, const Slice* keys, IndexValue* values) {
+Status LakePersistentIndex::get(size_t n, const Slice* keys, IndexValue* values, IOStat* stat) {
     KeyIndexesInfo not_founds;
     size_t num_found;
     return _memtable->get(n, keys, values, &not_founds, &num_found);

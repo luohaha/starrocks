@@ -86,7 +86,9 @@ enum CommitType {
 };
 
 struct IOStat {
-    uint32_t get_in_shard_cnt = 0;
+    std::atomic<int64_t> get_in_shard_cnt{0};
+    std::atomic<int64_t> get_in_shard_bytes{0};
+    std::atomic<int64_t> filter_kv_cnt{0};
     uint64_t get_in_shard_cost = 0;
     uint64_t read_io_bytes = 0;
     uint64_t l0_write_cost = 0;
@@ -97,10 +99,11 @@ struct IOStat {
 
     std::string print_str() {
         return fmt::format(
-                "IOStat get_in_shard_cnt: {} get_in_shard_cost: {} read_io_bytes: {} l0_write_cost: {} "
+                "IOStat get_in_shard_cnt: {} get_in_shard_bytes: {} get_in_shard_cost: {} read_io_bytes: {} "
+                "l0_write_cost: {} "
                 "l1_l2_read_cost: {} flush_or_wal_cost: {} compaction_cost: {} reload_meta_cost: {}",
-                get_in_shard_cnt, get_in_shard_cost, read_io_bytes, l0_write_cost, l1_l2_read_cost, flush_or_wal_cost,
-                compaction_cost, reload_meta_cost);
+                get_in_shard_cnt.load(), get_in_shard_bytes.load(), get_in_shard_cost, read_io_bytes, l0_write_cost,
+                l1_l2_read_cost, flush_or_wal_cost, compaction_cost, reload_meta_cost);
     }
 };
 
@@ -538,8 +541,8 @@ private:
                                         std::map<size_t, IndexPage>& pages) const;
 
     Status _get_in_shard_by_page(size_t shard_idx, size_t n, const Slice* keys, IndexValue* values,
-                                 KeysInfo* found_keys_info,
-                                 std::map<size_t, std::vector<KeyInfo>>& keys_info_by_page) const;
+                                 KeysInfo* found_keys_info, std::map<size_t, std::vector<KeyInfo>>& keys_info_by_page,
+                                 IOStat* stat) const;
 
     Status _get_in_shard(size_t shard_idx, size_t n, const Slice* keys, std::vector<KeyInfo>& keys_info,
                          IndexValue* values, KeysInfo* found_keys_info, IOStat* stat) const;
@@ -701,10 +704,11 @@ public:
     // |n|: size of key/value array
     // |keys|: key array as raw buffer
     // |values|: value array for return values
-    virtual Status get(size_t n, const Slice* keys, IndexValue* values);
+    virtual Status get(size_t n, const Slice* keys, IndexValue* values, IOStat* stat);
 
     Status get_from_one_immutable_index(ImmutableIndex* immu_index, size_t n, const Slice* keys, IndexValue* values,
-                                        std::map<size_t, KeysInfo>* keys_info_by_key_size, KeysInfo* found_keys_info);
+                                        std::map<size_t, KeysInfo>* keys_info_by_key_size, KeysInfo* found_keys_info,
+                                        IOStat* io_stat);
 
     // batch upsert
     // |n|: size of key/value array
@@ -834,7 +838,8 @@ private:
                                      std::map<size_t, KeysInfo>& keys_info_by_key_size, IOStat* stat);
 
     Status _get_from_immutable_index_parallel(size_t n, const Slice* keys, IndexValue* values,
-                                              std::map<size_t, KeysInfo>& keys_info_by_key_size);
+                                              std::map<size_t, KeysInfo>& keys_info_by_key_size,
+                                              IOStat* stat = nullptr);
 
     Status _update_usage_and_size_by_key_length(std::vector<std::pair<int64_t, int64_t>>& add_usage_and_size);
 

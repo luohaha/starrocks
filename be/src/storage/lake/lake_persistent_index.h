@@ -32,7 +32,7 @@ public:
     // |n|: size of key/value array
     // |keys|: key array as raw buffer
     // |values|: value array for return values
-    Status get(size_t n, const Slice* keys, IndexValue* values) override;
+    Status get(size_t n, const Slice* keys, IndexValue* values, IOStat* stat = nullptr) override;
 
     // batch upsert
     // |n|: size of key/value array

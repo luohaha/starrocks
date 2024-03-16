@@ -1274,7 +1274,7 @@ Status PrimaryIndex::_erase_persistent_index(const Column& key_col, DeletesMap* 
 Status PrimaryIndex::_get_from_persistent_index(const Column& key_col, std::vector<uint64_t>* rowids) const {
     std::vector<Slice> keys;
     const Slice* vkeys = _build_persistent_keys(key_col, 0, key_col.size(), &keys);
-    Status st = _persistent_index->get(key_col.size(), vkeys, reinterpret_cast<IndexValue*>(rowids->data()));
+    Status st = _persistent_index->get(key_col.size(), vkeys, reinterpret_cast<IndexValue*>(rowids->data()), nullptr);
     if (!st.ok()) {
         LOG(WARNING) << "failed get value from persistent index";
     }
