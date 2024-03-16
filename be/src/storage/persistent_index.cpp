@@ -24,6 +24,7 @@
 #include "io/io_profiler.h"
 #include "storage/chunk_helper.h"
 #include "storage/chunk_iterator.h"
+#include "storage/lake/tablet_manager.h"
 #include "storage/persistent_index_tablet_loader.h"
 #include "storage/primary_key_dump.h"
 #include "storage/primary_key_encoder.h"
@@ -53,6 +54,7 @@ constexpr size_t kBucketHeaderSize = 4;
 constexpr size_t kBucketPerPage = 16;
 constexpr size_t kRecordPerBucket = 8;
 constexpr size_t kShardMax = 1 << 16;
+constexpr size_t kShardSize = 64 * 1024;
 constexpr uint64_t kPageMax = 1ULL << 32;
 constexpr size_t kPackSize = 16;
 constexpr size_t kPagePackLimit = (kPageSize - kPageHeaderSize) / kPackSize;
@@ -657,6 +659,8 @@ Status ImmutableIndexWriter::write_bf() {
                 raw::stl_string_resize_uninitialized(&read_buffer, remaining);
             }
             RETURN_IF_ERROR(rfile->read_at_fully(offset, read_buffer.data(), read_buffer.size()));
+            ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->add_pindex_read_bytes(
+                    read_buffer.size());
             RETURN_IF_ERROR(_idx_wb->append(Slice(read_buffer.data(), read_buffer.size())));
             offset += read_buffer.size();
             remaining -= read_buffer.size();
@@ -713,6 +717,7 @@ Status ImmutableIndexWriter::finish() {
     put_fixed32_le(&footer, checksum);
     footer.append(kIndexFileMagic, 4);
     RETURN_IF_ERROR(_idx_wb->append(Slice(footer)));
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->add_pindex_write_bytes(_idx_wb->size());
     RETURN_IF_ERROR(_idx_wb->close());
     RETURN_IF_ERROR(FileSystem::Default()->rename_file(_idx_file_path_tmp, _idx_file_path));
     _idx_wb.reset();
@@ -852,6 +857,7 @@ public:
             put_fixed64_le(&fixed_buf, value.get_value());
         }
         RETURN_IF_ERROR(index_file->append(fixed_buf));
+        ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->add_pindex_write_bytes(fixed_buf.size());
         *page_size += fixed_buf.size();
         // incremental calc crc32
         *checksum = crc32c::Extend(*checksum, (const char*)fixed_buf.data(), fixed_buf.size());
@@ -971,7 +977,7 @@ std::tuple<size_t, size_t> MutableIndex::estimate_nshard_and_npage(const size_t 
     // if size == 0, will return { nshard:1, npage:0 }, meaning an empty shard
     size_t cap = total_kv_pairs_usage * 100 / kDefaultUsagePercent;
     size_t nshard = 1;
-    while (nshard * 1024 * 1024 < cap) {
+    while (nshard * kShardSize < cap) {
         nshard *= 2;
         if (nshard == kShardMax) {
             break;
@@ -1195,6 +1201,7 @@ public:
             put_fixed64_le(&fixed_buf, value.get_value());
         }
         RETURN_IF_ERROR(index_file->append(fixed_buf));
+        ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->add_pindex_write_bytes(fixed_buf.size());
         *page_size += fixed_buf.size();
         // incremental calc crc32
         *checksum = crc32c::Extend(*checksum, (const char*)fixed_buf.data(), fixed_buf.size());
@@ -2242,6 +2249,10 @@ Status ImmutableIndex::_get_kvs_for_shard(std::vector<std::vector<KVRef>>& kvs_b
     }
     *shard = std::make_unique<ImmutableIndexShard>(shard_info.npage);
     RETURN_IF_ERROR(_file->read_at_fully(shard_info.offset, (*shard)->pages.data(), shard_info.bytes));
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->add_pindex_read_bytes(shard_info.bytes);
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->_pindex_compaction_get_shard_cnt.fetch_add(1);
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->_pindex_compaction_get_shard_bytes.fetch_add(
+            shard_info.bytes);
     RETURN_IF_ERROR((*shard)->decompress_pages(_compression_type, shard_info.npage, shard_info.uncompressed_size,
                                                shard_info.bytes));
     if (shard_info.key_size != 0) {
@@ -2343,6 +2354,7 @@ bool ImmutableIndex::_filter(size_t shard_idx, std::vector<KeyInfo>& keys_info, 
     std::string bf_buff;
     raw::stl_string_resize_uninitialized(&bf_buff, len);
     Status st = _file->read_at_fully(off, bf_buff.data(), bf_buff.size());
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->add_pindex_read_bytes(bf_buff.size());
     if (!st.ok()) {
         LOG(WARNING) << "shard_idx: " << shard_idx << "read bloom filter failed, " << st;
         return false;
@@ -2412,6 +2424,8 @@ Status ImmutableIndex::_get_in_fixlen_shard_by_page(size_t shard_idx, size_t n, 
                     IndexPage page;
                     RETURN_IF_ERROR(_file->read_at_fully(shard_info.offset + kPageSize * bucket_info.pageid, page.data,
                                                          kPageSize));
+                    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->add_pindex_read_bytes(
+                            kPageSize);
                     pages[bucket_info.pageid] = std::move(page);
                     bucket_pos = pages[bucket_info.pageid].pack(bucket_info.packid);
                 }
@@ -2461,6 +2475,8 @@ Status ImmutableIndex::_get_in_varlen_shard_by_page(size_t shard_idx, size_t n, 
                     IndexPage page;
                     RETURN_IF_ERROR(_file->read_at_fully(shard_info.offset + kPageSize * bucket_info.pageid, page.data,
                                                          kPageSize));
+                    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->add_pindex_read_bytes(
+                            kPageSize);
                     pages[bucket_info.pageid] = std::move(page);
                     bucket_pos = pages[bucket_info.pageid].pack(bucket_info.packid);
                 }
@@ -2490,12 +2506,17 @@ Status ImmutableIndex::_get_in_varlen_shard_by_page(size_t shard_idx, size_t n, 
 
 Status ImmutableIndex::_get_in_shard_by_page(size_t shard_idx, size_t n, const Slice* keys, IndexValue* values,
                                              KeysInfo* found_keys_info,
-                                             std::map<size_t, std::vector<KeyInfo>>& keys_info_by_page) const {
+                                             std::map<size_t, std::vector<KeyInfo>>& keys_info_by_page,
+                                             IOStat* stat) const {
     const auto& shard_info = _shards[shard_idx];
     std::map<size_t, IndexPage> pages;
     for (auto [pageid, keys_info] : keys_info_by_page) {
         IndexPage page;
         RETURN_IF_ERROR(_file->read_at_fully(shard_info.offset + kPageSize * pageid, page.data, kPageSize));
+        ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->add_pindex_read_bytes(kPageSize);
+        if (stat != nullptr) {
+            stat->get_in_shard_bytes.fetch_add(kPageSize);
+        }
         pages[pageid] = std::move(page);
     }
     if (shard_info.key_size != 0) {
@@ -2543,12 +2564,19 @@ Status ImmutableIndex::_get_in_shard(size_t shard_idx, size_t n, const Slice* ke
     if (shard_info.size == 0 || shard_info.npage == 0 || keys_info.size() == 0) {
         return Status::OK();
     }
+    if (stat != nullptr) {
+        stat->get_in_shard_cnt.fetch_add(1);
+    }
 
     DCHECK(_bf_vec.empty() || _bf_vec.size() > shard_idx);
     std::vector<KeyInfo> check_keys_info;
     bool filter = _filter(shard_idx, keys_info, &check_keys_info);
     if (!filter) {
         check_keys_info.swap(keys_info);
+    } else {
+        if (stat != nullptr) {
+            stat->filter_kv_cnt.fetch_add(keys_info.size() - check_keys_info.size());
+        }
     }
 
     // an optimization for very small data import. In some real time scenario, user only import a very small batch data
@@ -2560,7 +2588,7 @@ Status ImmutableIndex::_get_in_shard(size_t shard_idx, size_t n, const Slice* ke
     }
 
     if (st.ok() && keys_info_by_page.size() == 1 && shard_info.uncompressed_size == 0) {
-        return _get_in_shard_by_page(shard_idx, n, keys, values, found_keys_info, keys_info_by_page);
+        return _get_in_shard_by_page(shard_idx, n, keys, values, found_keys_info, keys_info_by_page, stat);
     }
 
     std::unique_ptr<ImmutableIndexShard> shard = std::make_unique<ImmutableIndexShard>(shard_info.npage);
@@ -2570,10 +2598,12 @@ Status ImmutableIndex::_get_in_shard(size_t shard_idx, size_t n, const Slice* ke
         CHECK(shard->pages.size() * kPageSize == shard_info.uncompressed_size) << "illegal shard size";
     }
     RETURN_IF_ERROR(_file->read_at_fully(shard_info.offset, shard->pages.data(), shard_info.bytes));
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->add_pindex_read_bytes(shard_info.bytes);
     RETURN_IF_ERROR(shard->decompress_pages(_compression_type, shard_info.npage, shard_info.uncompressed_size,
                                             shard_info.bytes));
     if (stat != nullptr) {
         stat->read_io_bytes += shard_info.bytes;
+        stat->get_in_shard_bytes.fetch_add(shard_info.bytes);
     }
     if (shard_info.key_size != 0) {
         return _get_in_fixlen_shard(shard_idx, n, keys, check_keys_info, values, found_keys_info, &shard);
@@ -2653,6 +2683,7 @@ Status ImmutableIndex::_check_not_exist_in_shard(size_t shard_idx, size_t n, con
         CHECK(shard->pages.size() * kPageSize == shard_info.uncompressed_size) << "illegal shard size";
     }
     RETURN_IF_ERROR(_file->read_at_fully(shard_info.offset, shard->pages.data(), shard_info.bytes));
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->add_pindex_read_bytes(shard_info.bytes);
     RETURN_IF_ERROR(shard->decompress_pages(_compression_type, shard_info.npage, shard_info.uncompressed_size,
                                             shard_info.bytes));
     if (shard_info.key_size != 0) {
@@ -2728,6 +2759,7 @@ Status ImmutableIndex::_prepare_bloom_filter(size_t idx_begin, size_t idx_end) c
             std::string buff;
             raw::stl_string_resize_uninitialized(&buff, bytes);
             RETURN_IF_ERROR(_file->read_at_fully(offset, buff.data(), buff.size()));
+            ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->add_pindex_read_bytes(buff.size());
             for (size_t i = 0; i < num; i++) {
                 size_t buff_off = _bf_off[start_idx + i] - _bf_off[start_idx];
                 size_t buff_size = _bf_off[start_idx + i + 1] - _bf_off[start_idx + i];
@@ -2750,6 +2782,7 @@ Status ImmutableIndex::_prepare_bloom_filter(size_t idx_begin, size_t idx_end) c
         std::string buff;
         raw::stl_string_resize_uninitialized(&buff, bytes);
         RETURN_IF_ERROR(_file->read_at_fully(offset, buff.data(), buff.size()));
+        ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->add_pindex_read_bytes(buff.size());
         for (size_t i = 0; i < num; i++) {
             size_t buff_off = _bf_off[start_idx + i] - _bf_off[start_idx];
             size_t buff_size = _bf_off[start_idx + i + 1] - _bf_off[start_idx + i];
@@ -2783,7 +2816,6 @@ Status ImmutableIndex::get(size_t n, const Slice* keys, KeysInfo& keys_info, Ind
                                           found_keys_info, stat));
         }
         if (stat != nullptr) {
-            stat->get_in_shard_cnt += nshard;
             stat->get_in_shard_cost += watch.elapsed_time();
         }
     } else {
@@ -2796,7 +2828,6 @@ Status ImmutableIndex::get(size_t n, const Slice* keys, KeysInfo& keys_info, Ind
         }
         RETURN_IF_ERROR(_get_in_shard(shard_off, n, keys, infos.key_infos, values, found_keys_info, stat));
         if (stat != nullptr) {
-            stat->get_in_shard_cnt++;
             stat->get_in_shard_cost += watch.elapsed_time();
         }
     }
@@ -3496,7 +3527,7 @@ class GetFromImmutableIndexTask : public Runnable {
 public:
     GetFromImmutableIndexTask(size_t num, ImmutableIndex* immu_index, const Slice* keys, IndexValue* values,
                               std::map<size_t, KeysInfo>* keys_info_by_key_size, KeysInfo* found_keys_info,
-                              PersistentIndex* index, IOStatEntry* io_stat_entry)
+                              PersistentIndex* index, IOStatEntry* io_stat_entry, IOStat* io_stat)
             : _num(num),
               _immu_index(immu_index),
               _keys(keys),
@@ -3504,12 +3535,13 @@ public:
               _keys_info_by_key_size(keys_info_by_key_size),
               _found_keys_info(found_keys_info),
               _index(index),
-              _io_stat_entry(io_stat_entry) {}
+              _io_stat_entry(io_stat_entry),
+              _io_stat(io_stat) {}
 
     void run() override {
         auto scope = IOProfiler::scope(_io_stat_entry);
         WARN_IF_ERROR(_index->get_from_one_immutable_index(_immu_index, _num, _keys, _values, _keys_info_by_key_size,
-                                                           _found_keys_info),
+                                                           _found_keys_info, _io_stat),
                       "Failed to run GetFromImmutableIndexTask");
     }
 
@@ -3522,15 +3554,16 @@ private:
     KeysInfo* _found_keys_info;
     PersistentIndex* _index;
     IOStatEntry* _io_stat_entry;
+    IOStat* _io_stat;
 };
 
 Status PersistentIndex::get_from_one_immutable_index(ImmutableIndex* immu_index, size_t n, const Slice* keys,
                                                      IndexValue* values,
                                                      std::map<size_t, KeysInfo>* keys_info_by_key_size,
-                                                     KeysInfo* found_keys_info) {
+                                                     KeysInfo* found_keys_info, IOStat* io_stat) {
     Status st;
     for (auto& [key_size, keys_info] : (*keys_info_by_key_size)) {
-        st = immu_index->get(n, keys, keys_info, values, found_keys_info, key_size, nullptr);
+        st = immu_index->get(n, keys, keys_info, values, found_keys_info, key_size, io_stat);
         if (!st.ok()) {
             std::string msg = strings::Substitute("get from one immutableindex failed, file: $0, status: $1",
                                                   immu_index->filename(), st.to_string());
@@ -3548,7 +3581,8 @@ Status PersistentIndex::get_from_one_immutable_index(ImmutableIndex* immu_index,
 }
 
 Status PersistentIndex::_get_from_immutable_index_parallel(size_t n, const Slice* keys, IndexValue* values,
-                                                           std::map<size_t, KeysInfo>& keys_info_by_key_size) {
+                                                           std::map<size_t, KeysInfo>& keys_info_by_key_size,
+                                                           IOStat* io_stat) {
     if (_l1_vec.empty() && _l2_vec.empty()) {
         return Status::OK();
     }
@@ -3564,7 +3598,7 @@ Status PersistentIndex::_get_from_immutable_index_parallel(size_t n, const Slice
         ImmutableIndex* immu_index = i < _l2_vec.size() ? _l2_vec[i].get() : _l1_vec[i - _l2_vec.size()].get();
         std::shared_ptr<Runnable> r(std::make_shared<GetFromImmutableIndexTask>(
                 n, immu_index, keys, reinterpret_cast<IndexValue*>(get_values[i].data()), &keys_info_by_key_size,
-                &_found_keys_info[i], this, IOProfiler::get_context()));
+                &_found_keys_info[i], this, IOProfiler::get_context(), io_stat));
         auto st = StorageEngine::instance()->update_manager()->get_pindex_thread_pool()->submit(std::move(r));
         if (!st.ok()) {
             error_msg = strings::Substitute("get from immutable index failed: $0", st.to_string());
@@ -3619,12 +3653,12 @@ void PersistentIndex::_get_l2_stat(const std::vector<std::unique_ptr<ImmutableIn
             });
 }
 
-Status PersistentIndex::get(size_t n, const Slice* keys, IndexValue* values) {
+Status PersistentIndex::get(size_t n, const Slice* keys, IndexValue* values, IOStat* stat) {
     std::map<size_t, KeysInfo> not_founds_by_key_size;
     size_t num_found = 0;
     RETURN_IF_ERROR(_l0->get(n, keys, values, &num_found, not_founds_by_key_size));
     if (config::enable_parallel_get_and_bf) {
-        return _get_from_immutable_index_parallel(n, keys, values, not_founds_by_key_size);
+        return _get_from_immutable_index_parallel(n, keys, values, not_founds_by_key_size, stat);
     }
     return _get_from_immutable_index(n, keys, values, not_founds_by_key_size, nullptr);
 }
@@ -3707,16 +3741,24 @@ Status PersistentIndex::upsert(size_t n, const Slice* keys, const IndexValue* va
     size_t num_found = 0;
     MonotonicStopWatch watch;
     watch.start();
+    IOStat io_stat;
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->_pindex_upsert_rows.fetch_add(n);
     RETURN_IF_ERROR(_l0->upsert(n, keys, values, old_values, &num_found, not_founds_by_key_size));
     if (stat != nullptr) {
         stat->l0_write_cost += watch.elapsed_time();
         watch.reset();
     }
     if (config::enable_parallel_get_and_bf) {
-        RETURN_IF_ERROR(_get_from_immutable_index_parallel(n, keys, old_values, not_founds_by_key_size));
+        RETURN_IF_ERROR(_get_from_immutable_index_parallel(n, keys, old_values, not_founds_by_key_size, &io_stat));
     } else {
         RETURN_IF_ERROR(_get_from_immutable_index(n, keys, old_values, not_founds_by_key_size, stat));
     }
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->_pindex_upsert_get_shard_cnt.fetch_add(
+            io_stat.get_in_shard_cnt.load());
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->_pindex_upsert_get_shard_bytes.fetch_add(
+            io_stat.get_in_shard_bytes.load());
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->_pindex_upsert_filter_rows.fetch_add(
+            io_stat.filter_kv_cnt.load());
     if (stat != nullptr) {
         stat->l1_l2_read_cost += watch.elapsed_time();
         watch.reset();
@@ -3807,7 +3849,7 @@ Status PersistentIndex::erase(size_t n, const Slice* keys, IndexValue* old_value
                                                      std::vector<uint32_t>* failed) {
     std::vector<IndexValue> found_values;
     found_values.resize(n);
-    RETURN_IF_ERROR(get(n, keys, found_values.data()));
+    RETURN_IF_ERROR(get(n, keys, found_values.data(), nullptr));
     std::vector<size_t> replace_idxes;
     for (size_t i = 0; i < n; ++i) {
         if (found_values[i].get_value() != NullIndexValue &&
@@ -3823,9 +3865,18 @@ Status PersistentIndex::erase(size_t n, const Slice* keys, IndexValue* old_value
 
 Status PersistentIndex::try_replace(size_t n, const Slice* keys, const IndexValue* values, const uint32_t max_src_rssid,
                                     std::vector<uint32_t>* failed) {
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->_pindex_replace_rows.fetch_add(n);
     std::vector<IndexValue> found_values;
     found_values.resize(n);
-    RETURN_IF_ERROR(get(n, keys, found_values.data()));
+    IOStat io_stat;
+    RETURN_IF_ERROR(get(n, keys, found_values.data(), &io_stat));
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->_pindex_replace_get_shard_cnt.fetch_add(
+            io_stat.get_in_shard_cnt.load());
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->_pindex_replace_get_shard_bytes.fetch_add(
+            io_stat.get_in_shard_bytes.load());
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->_pindex_replace_cnt.fetch_add(1);
+    ExecEnv::GetInstance()->lake_tablet_manager()->get_compaction_amp()->_pindex_replace_filter_rows.fetch_add(
+            io_stat.filter_kv_cnt.load());
     std::vector<size_t> replace_idxes;
     for (size_t i = 0; i < n; ++i) {
         auto found_value = found_values[i].get_value();
