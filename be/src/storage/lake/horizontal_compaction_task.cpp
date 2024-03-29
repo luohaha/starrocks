@@ -16,6 +16,7 @@
 
 #include "runtime/runtime_state.h"
 #include "storage/chunk_helper.h"
+#include "storage/compaction_delvec_reader.h"
 #include "storage/compaction_utils.h"
 #include "storage/lake/rowset.h"
 #include "storage/lake/tablet_reader.h"
@@ -59,6 +60,7 @@ Status HorizontalCompactionTask::execute(CancelFunc cancel_func, ThreadPool* flu
 
     auto chunk = ChunkHelper::new_chunk(schema, chunk_size);
     auto char_field_indexes = ChunkHelper::get_char_field_indexes(schema);
+    std::vector<uint64_t> rssid_rowids;
 
     int64_t reader_time_ns = 0;
     while (true) {
@@ -73,14 +75,25 @@ Status HorizontalCompactionTask::execute(CancelFunc cancel_func, ThreadPool* flu
 #endif
         {
             SCOPED_RAW_TIMER(&reader_time_ns);
-            if (auto st = reader.get_next(chunk.get()); st.is_end_of_file()) {
+            auto st = Status::OK();
+            if (tablet_schema->keys_type() == KeysType::PRIMARY_KEYS) {
+                st = reader.get_next(chunk.get(), &rssid_rowids);
+            } else {
+                st = reader.get_next(chunk.get());
+            }
+            if (st.is_end_of_file()) {
                 break;
             } else if (!st.ok()) {
                 return st;
             }
         }
         ChunkHelper::padding_char_columns(char_field_indexes, schema, tablet_schema, chunk.get());
-        RETURN_IF_ERROR(writer->write(*chunk));
+        if (rssid_rowids.empty()) {
+            RETURN_IF_ERROR(writer->write(*chunk));
+        } else {
+            // pk table compaction
+            RETURN_IF_ERROR(writer->write(*chunk, rssid_rowids));
+        }
         chunk->reset();
 
         _context->progress.update(100 * reader.stats().raw_rows_read / total_num_rows);

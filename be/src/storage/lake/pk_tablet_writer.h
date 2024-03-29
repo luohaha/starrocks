@@ -23,7 +23,8 @@
 
 namespace starrocks {
 class SegmentWriter;
-}
+class RowsMapperBuilder;
+} // namespace starrocks
 
 namespace starrocks::lake {
 
@@ -37,9 +38,7 @@ public:
 
     DISALLOW_COPY(HorizontalPkTabletWriter);
 
-    Status write_columns(const Chunk& data, const std::vector<uint32_t>& column_indexes, bool is_key) override {
-        return Status::NotSupported("HorizontalPkTabletWriter write_columns not support");
-    }
+    Status write(const Chunk& data, const std::vector<uint64_t>& rssid_rowids, SegmentPB* segment = nullptr) override;
 
     Status flush_del_file(const Column& deletes) override;
 
@@ -54,6 +53,7 @@ protected:
 
 private:
     std::unique_ptr<RowsetTxnMetaPB> _rowset_txn_meta;
+    std::unique_ptr<RowsMapperBuilder> _rows_mapper_builder;
 };
 
 class VerticalPkTabletWriter : public VerticalGeneralTabletWriter {
@@ -73,6 +73,12 @@ public:
     Status flush_del_file(const Column& deletes) override {
         return Status::NotSupported("VerticalPkTabletWriter flush_del_file not support");
     }
+
+    Status write_columns(const Chunk& data, const std::vector<uint32_t>& column_indexes, bool is_key,
+                         const std::vector<uint64_t>& rssid_rowids) override;
+
+private:
+    std::unique_ptr<RowsMapperBuilder> _rows_mapper_builder;
 };
 
 } // namespace starrocks::lake

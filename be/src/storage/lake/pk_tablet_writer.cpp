@@ -19,9 +19,11 @@
 #include "column/chunk.h"
 #include "fs/fs_util.h"
 #include "serde/column_array_serde.h"
+#include "storage/compaction_delvec_reader.h"
 #include "storage/lake/filenames.h"
 #include "storage/lake/tablet_manager.h"
 #include "storage/rowset/segment_writer.h"
+#include "util/runtime_profile.h"
 
 namespace starrocks::lake {
 
@@ -29,9 +31,33 @@ HorizontalPkTabletWriter::HorizontalPkTabletWriter(TabletManager* tablet_mgr, in
                                                    std::shared_ptr<const TabletSchema> schema, int64_t txn_id,
                                                    ThreadPool* flush_pool)
         : HorizontalGeneralTabletWriter(tablet_mgr, tablet_id, std::move(schema), txn_id, flush_pool),
-          _rowset_txn_meta(std::make_unique<RowsetTxnMetaPB>()) {}
+          _rowset_txn_meta(std::make_unique<RowsetTxnMetaPB>()),
+          _rows_mapper_builder(std::make_unique<RowsMapperBuilder>(compaction_row_mapper_filename(tablet_id, txn_id))) {
+}
 
-HorizontalPkTabletWriter::~HorizontalPkTabletWriter() = default;
+HorizontalPkTabletWriter::~HorizontalPkTabletWriter() {
+    auto st = _rows_mapper_builder->finalize();
+    if (!st.ok()) {
+        LOG(WARNING) << "row mapper builder finalize fail : " << st.to_string();
+    }
+}
+
+Status HorizontalPkTabletWriter::write(const Chunk& data, const std::vector<uint64_t>& rssid_rowids,
+                                       SegmentPB* segment) {
+    SCOPED_RAW_TIMER(&_stats.segment_write_ns);
+    if (_seg_writer == nullptr || _seg_writer->estimate_segment_size() >= config::max_segment_file_size ||
+        _seg_writer->num_rows_written() + data.num_rows() >= INT32_MAX /*TODO: configurable*/) {
+        if (_seg_writer != nullptr) {
+            _rows_mapper_builder->finalize_segment(_seg_writer->num_rows());
+        }
+        RETURN_IF_ERROR(flush_segment_writer(segment));
+        RETURN_IF_ERROR(reset_segment_writer());
+    }
+    RETURN_IF_ERROR(_seg_writer->append_chunk(data));
+    RETURN_IF_ERROR(_rows_mapper_builder->append(rssid_rowids));
+    _num_rows += data.num_rows();
+    return Status::OK();
+}
 
 Status HorizontalPkTabletWriter::flush_del_file(const Column& deletes) {
     auto name = gen_del_filename(_txn_id);
@@ -75,8 +101,45 @@ VerticalPkTabletWriter::VerticalPkTabletWriter(TabletManager* tablet_mgr, int64_
                                                std::shared_ptr<const TabletSchema> schema, int64_t txn_id,
                                                uint32_t max_rows_per_segment, ThreadPool* flush_pool)
         : VerticalGeneralTabletWriter(tablet_mgr, tablet_id, std::move(schema), txn_id, max_rows_per_segment,
-                                      flush_pool) {}
+                                      flush_pool),
+          _rows_mapper_builder(std::make_unique<RowsMapperBuilder>(compaction_row_mapper_filename(tablet_id, txn_id))) {
+}
 
-VerticalPkTabletWriter::~VerticalPkTabletWriter() = default;
+VerticalPkTabletWriter::~VerticalPkTabletWriter() {
+    auto st = _rows_mapper_builder->finalize();
+    if (!st.ok()) {
+        LOG(WARNING) << "row mapper builder finalize fail : " << st.to_string();
+    }
+}
+
+Status VerticalPkTabletWriter::write_columns(const Chunk& data, const std::vector<uint32_t>& column_indexes,
+                                             bool is_key, const std::vector<uint64_t>& rssid_rowids) {
+    // Save rssid_rowids only when writing key columns
+    DCHECK(is_key);
+    SCOPED_RAW_TIMER(&_stats.segment_write_ns);
+    const size_t chunk_num_rows = data.num_rows();
+    if (_segment_writers.empty()) {
+        auto segment_writer = create_segment_writer(column_indexes, is_key);
+        if (!segment_writer.ok()) return segment_writer.status();
+        _segment_writers.emplace_back(std::move(segment_writer).value());
+        _current_writer_index = 0;
+        RETURN_IF_ERROR(_segment_writers[_current_writer_index]->append_chunk(data));
+    } else {
+        // key columns
+        if (_segment_writers[_current_writer_index]->num_rows_written() + chunk_num_rows >= _max_rows_per_segment) {
+            _rows_mapper_builder->finalize_segment(_segment_writers[_current_writer_index]->num_rows());
+            RETURN_IF_ERROR(flush_columns(_segment_writers[_current_writer_index]));
+            auto segment_writer = create_segment_writer(column_indexes, is_key);
+            if (!segment_writer.ok()) return segment_writer.status();
+            _segment_writers.emplace_back(std::move(segment_writer).value());
+            ++_current_writer_index;
+        }
+        RETURN_IF_ERROR(_segment_writers[_current_writer_index]->append_chunk(data));
+    }
+
+    RETURN_IF_ERROR(_rows_mapper_builder->append(rssid_rowids));
+    _num_rows += chunk_num_rows;
+    return Status::OK();
+}
 
 } // namespace starrocks::lake

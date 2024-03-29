@@ -241,6 +241,7 @@ add_library(Storage STATIC
     lake/local_pk_index_manager.cpp
     primary_key_dump.cpp
     dictionary_cache_manager.cpp
+    compaction_delvec_reader.cpp
     inverted/index_descriptor.hpp
     inverted/inverted_index_iterator.cpp
     inverted/inverted_index_iterator.cpp

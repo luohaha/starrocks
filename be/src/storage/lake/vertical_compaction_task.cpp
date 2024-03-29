@@ -164,6 +164,7 @@ Status VerticalCompactionTask::compact_column_group(bool is_key, int column_grou
 
     auto chunk = ChunkHelper::new_chunk(schema, chunk_size);
     auto char_field_indexes = ChunkHelper::get_char_field_indexes(schema);
+    std::vector<uint64_t> rssid_rowids;
 
     VLOG(3) << "Compact column group. tablet: " << _tablet.id() << ", column group: " << column_group_index
             << ", reader chunk size: " << chunk_size;
@@ -181,7 +182,14 @@ Status VerticalCompactionTask::compact_column_group(bool is_key, int column_grou
 #endif
         {
             SCOPED_RAW_TIMER(&reader_time_ns);
-            if (auto st = reader.get_next(chunk.get(), source_masks); st.is_end_of_file()) {
+            auto st = Status::OK();
+            // Collect rssid & rowid only when compact primary key columns
+            if (_tablet_schema->keys_type() == KeysType::PRIMARY_KEYS && is_key) {
+                st = reader.get_next(chunk.get(), source_masks, &rssid_rowids);
+            } else {
+                st = reader.get_next(chunk.get(), source_masks);
+            }
+            if (st.is_end_of_file()) {
                 break;
             } else if (!st.ok()) {
                 return st;
@@ -189,7 +197,11 @@ Status VerticalCompactionTask::compact_column_group(bool is_key, int column_grou
         }
 
         ChunkHelper::padding_char_columns(char_field_indexes, schema, _tablet_schema, chunk.get());
-        RETURN_IF_ERROR(writer->write_columns(*chunk, column_group, is_key));
+        if (rssid_rowids.empty()) {
+            RETURN_IF_ERROR(writer->write_columns(*chunk, column_group, is_key));
+        } else {
+            RETURN_IF_ERROR(writer->write_columns(*chunk, column_group, is_key, rssid_rowids));
+        }
         chunk->reset();
 
         if (!source_masks->empty()) {
