@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <gtest/gtest.h>
+
 #include "common/status.h"
 #include "gen_cpp/persistent_index.pb.h"
 
@@ -73,10 +75,11 @@ public:
     Status status() const;
 
 private:
+    inline static const size_t READ_ROW_COUNT_EACH_TIME = 1024;
+    inline static const size_t EACH_ROW_SIZE = 8; // 8 bytes
+
     Status _transfer_row_mapper(const std::vector<uint64_t>& rssid_rowids, uint64_t start_pos);
     Status _next();
-    static const size_t READ_ROW_COUNT_EACH_TIME = 1024;
-    static const size_t EACH_ROW_SIZE = 8; // 8 bytes
 
 private:
     std::unique_ptr<RandomAccessFile> _rfile;

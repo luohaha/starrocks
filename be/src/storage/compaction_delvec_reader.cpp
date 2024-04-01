@@ -49,18 +49,22 @@ void RowsMapperBuilder::finalize_segment(uint32_t row_num) {
     }
 }
 
+static Status footer_check(const RowsetMapperFooterPB& footer) {
+    if (footer.segment_row_offsets_size() > 0 &&
+        footer.segment_row_offsets(footer.segment_row_offsets_size() - 1) + 1 != footer.row_nums()) {
+        std::string error_msg = fmt::format("Invalid footer, footer: {}", footer.ShortDebugString());
+        LOG(ERROR) << error_msg;
+        return Status::InternalError(error_msg);
+    }
+    return Status::OK();
+}
+
 Status RowsMapperBuilder::finalize() {
     if (_wfile == nullptr) {
         // Empty rows, skip finalize
         return Status::OK();
     }
-    if (_footer.segment_row_offsets_size() > 0 &&
-        _footer.segment_row_offsets(_footer.segment_row_offsets_size() - 1) != _footer.row_nums()) {
-        std::string error_msg =
-                fmt::format("Invalid footer, filename: {}, footer: {}", _filename, _footer.ShortDebugString());
-        LOG(ERROR) << error_msg;
-        return Status::InternalError(error_msg);
-    }
+    RETURN_IF_ERROR(footer_check(_footer));
     std::string footer_str;
     if (_footer.SerializeToString(&footer_str)) {
         _checksum = crc32c::Extend(_checksum, footer_str.data(), footer_str.size());
@@ -103,27 +107,21 @@ Status RowsMapperIterator::open(const std::string& filename) {
         return Status::Corruption(fmt::format("RowsMapper file corruption. file size: {}, footer size: {}, row num: {}",
                                               file_size, footer_size, _footer.row_nums()));
     }
-    _current_checksum = crc32c::Extend(_current_checksum, footer_str.data(), footer_str.size());
     // 4. check footer
-    if (_footer.segment_row_offsets_size() > 0 &&
-        _footer.segment_row_offsets(_footer.segment_row_offsets_size() - 1) != _footer.row_nums()) {
-        std::string error_msg =
-                fmt::format("Invalid footer, filename: {}, footer: {}", filename, _footer.ShortDebugString());
-        LOG(ERROR) << error_msg;
-        return Status::InternalError(error_msg);
-    }
+    RETURN_IF_ERROR(footer_check(_footer));
     // 5. build offset map
     for (uint32_t i = 0; i < _footer.segment_row_offsets_size(); i++) {
         _offset_to_sid[_footer.segment_row_offsets(i)] = i;
     }
+    // 6. get next
+    RETURN_IF_ERROR(_next());
     return Status::OK();
 }
 
 // Return true when iterator meet end of file
 bool RowsMapperIterator::end_of_file() const {
-    DCHECK(_pos <= _footer.row_nums() + 1);
-    // When _pos point to final row's next position, which means it ends
-    return _pos >= _footer.row_nums() + 1;
+    // When pos large than row number, means end of file.
+    return _pos > _footer.row_nums();
 }
 
 // Move to next position
@@ -132,9 +130,20 @@ void RowsMapperIterator::next() {
 }
 
 Status RowsMapperIterator::_next() {
+    if (end_of_file()) {
+        return Status::OK();
+    }
+    _current_val.clear();
     size_t prefetch_cnt = std::min(READ_ROW_COUNT_EACH_TIME, _footer.row_nums() - _pos);
     if (prefetch_cnt == 0) {
         // End of file
+        _pos++;
+        std::string footer_str;
+        if (_footer.SerializeToString(&footer_str)) {
+            _current_checksum = crc32c::Extend(_current_checksum, footer_str.data(), footer_str.size());
+        } else {
+            return Status::InternalError("RowsetMapperFooterPB serialize fail");
+        }
         return Status::OK();
     }
     std::vector<uint64_t> rssid_rowids(prefetch_cnt);
@@ -147,7 +156,6 @@ Status RowsMapperIterator::_next() {
 }
 
 Status RowsMapperIterator::_transfer_row_mapper(const std::vector<uint64_t>& rssid_rowids, uint64_t start_pos) {
-    _current_val.clear();
     for (size_t i = 0; i < rssid_rowids.size(); i++) {
         const uint64_t id = rssid_rowids[i];
         auto iter = _offset_to_sid.lower_bound(id);
@@ -159,9 +167,10 @@ Status RowsMapperIterator::_transfer_row_mapper(const std::vector<uint64_t>& rss
         // <output segment id, output rowid, input segment id, input rowid>
         if (iter == _offset_to_sid.begin()) {
             // first segment in output rowset
-            _current_val.emplace_back(iter->second, start_pos + id, id >> 32, id & 0xffffffff);
+            _current_val.emplace_back(iter->second, start_pos + i, id >> 32, id & 0xffffffff);
         } else {
-            _current_val.emplace_back(iter->second, start_pos + id - (--iter)->first - 1, id >> 32, id & 0xffffffff);
+            auto prevIt = std::prev(iter);
+            _current_val.emplace_back(iter->second, start_pos + i - prevIt->first - 1, id >> 32, id & 0xffffffff);
         }
     }
     return Status::OK();

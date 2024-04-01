@@ -15,36 +15,39 @@
 #include "storage/compaction_delvec_reader.h"
 
 #include "fs/fs.h"
+#include "fs/fs_util.h"
+#include "testutil/assert.h"
 
 namespace starrocks {
 
 class CompactionDelvecReaderTest : public testing::Test {
 public:
-    CompactionDelvecReaderTest() : TestBase(kTestDirectory) {}
+    CompactionDelvecReaderTest() {}
 
 protected:
-    constexpr static const char* const kTestDirectory = "test_compaction_delvec_reader";
+    constexpr static const char* kTestDirectory = "./test_compaction_delvec_reader/";
 
-    void SetUp() override {}
+    void SetUp() override { ASSERT_OK(fs::create_directories(kTestDirectory)); }
 
     void TearDown() override { (void)fs::remove_all(kTestDirectory); }
 
-    void generate_rssid_rowids(std::vector<uint64_t>* rssid_rowids, uint64_t start, size_t count) {
-        for (uint64_t i = start; i < count; i++) {
-            rssid_rowids->push_back(i);
+    // generate id between [start, end)
+    void generate_rssid_rowids(std::vector<uint64_t>* rssid_rowids, uint64_t start, size_t end, uint64_t rssid = 0) {
+        for (uint64_t i = start; i < end; i++) {
+            rssid_rowids->push_back((rssid << 32) | i);
         }
     }
 };
 
-TEST_P(CompactionDelvecReaderTest, test_write_read) {
-    const std::string filename = kTestDirectory + "/test_write_read.crm";
-    RowsMapperBuilder buidler(filename);
+TEST_F(CompactionDelvecReaderTest, test_write_read) {
+    const std::string filename = std::string(kTestDirectory) + "test_write_read.crm";
+    RowsMapperBuilder builder(filename);
     std::vector<uint64_t> rssid_rowids;
-    generate_rssid_rowids(rssid_rowids, 0, 1000);
-    ASSERT_OK(buidler.append(rssid_rowids));
+    generate_rssid_rowids(&rssid_rowids, 0, 1000);
+    ASSERT_OK(builder.append(rssid_rowids));
     rssid_rowids.clear();
-    generate_rssid_rowids(rssid_rowids, 1000, 2000);
-    ASSERT_OK(buidler.append(rssid_rowids));
+    generate_rssid_rowids(&rssid_rowids, 1000, 3000);
+    ASSERT_OK(builder.append(rssid_rowids));
     builder.finalize_segment(3000);
     ASSERT_OK(builder.finalize());
 
@@ -61,6 +64,48 @@ TEST_P(CompactionDelvecReaderTest, test_write_read) {
             ASSERT_TRUE(each.input_rowid == counter);
             ASSERT_TRUE(each.output_segment_id == 0);
             ASSERT_TRUE(each.output_rowid == counter);
+            counter++;
+        }
+    }
+    ASSERT_TRUE(counter == 3000);
+    ASSERT_OK(iterator.status());
+}
+
+TEST_F(CompactionDelvecReaderTest, test_write_read_multi_segment) {
+    const std::string filename = std::string(kTestDirectory) + "test_write_read_multi_segment.crm";
+    RowsMapperBuilder builder(filename);
+    std::vector<uint64_t> rssid_rowids;
+    // rssid = 11
+    generate_rssid_rowids(&rssid_rowids, 0, 1000, 11);
+    ASSERT_OK(builder.append(rssid_rowids));
+    builder.finalize_segment(1000);
+    rssid_rowids.clear();
+    // rssid = 43
+    generate_rssid_rowids(&rssid_rowids, 1000, 3000, 43);
+    ASSERT_OK(builder.append(rssid_rowids));
+    builder.finalize_segment(2000);
+    ASSERT_OK(builder.finalize());
+
+    // read from file
+    uint32_t counter = 0;
+    RowsMapperIterator iterator;
+    ASSERT_OK(iterator.open(filename));
+    for (; !iterator.end_of_file() && iterator.status().ok(); iterator.next()) {
+        std::vector<RowsMapper> rows_mapper;
+        iterator.value(&rows_mapper);
+        ASSERT_TRUE(!rows_mapper.empty());
+        for (const auto& each : rows_mapper) {
+            if (counter < 1000) {
+                ASSERT_TRUE(each.input_rssid == 11);
+                ASSERT_TRUE(each.input_rowid == counter);
+                ASSERT_TRUE(each.output_segment_id == 0);
+                ASSERT_TRUE(each.output_rowid == counter);
+            } else {
+                ASSERT_TRUE(each.input_rssid == 43);
+                ASSERT_TRUE(each.input_rowid == counter);
+                ASSERT_TRUE(each.output_segment_id == 1);
+                ASSERT_TRUE(each.output_rowid == counter - 1000);
+            }
             counter++;
         }
     }
