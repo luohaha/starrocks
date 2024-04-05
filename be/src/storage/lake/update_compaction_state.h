@@ -18,6 +18,7 @@
 #include <unordered_map>
 
 #include "common/status.h"
+#include "storage/lake/tablet_metadata.h"
 #include "storage/lake/types_fwd.h"
 #include "storage/olap_common.h"
 #include "storage/tablet_schema.h"
@@ -27,6 +28,8 @@ namespace starrocks {
 namespace lake {
 class Rowset;
 class UpdateManager;
+class MetaFileBuilder;
+class LakePrimaryIndex;
 
 class CompactionState {
 public:

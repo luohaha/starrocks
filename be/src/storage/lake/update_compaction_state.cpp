@@ -17,9 +17,12 @@
 #include "gutil/strings/substitute.h"
 #include "storage/chunk_helper.h"
 #include "storage/chunk_iterator.h"
+#include "storage/lake/filenames.h"
+#include "storage/lake/meta_file.h"
 #include "storage/lake/rowset.h"
 #include "storage/lake/update_manager.h"
 #include "storage/primary_key_encoder.h"
+#include "storage/rows_mapper.h"
 #include "storage/tablet_manager.h"
 #include "util/trace.h"
 

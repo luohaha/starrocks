@@ -347,8 +347,8 @@ public:
 
     // batch replace
     // |keys|: key array as raw buffer
+    // |replace_idxes| replace indexs of keys
     // |values|: new value array
-    // |idxes|: the idx array of the kv needed to be replaced
     Status replace(const Slice* keys, const IndexValue* values, const std::vector<size_t>& idxes);
 
     Status append_wal(size_t n, const Slice* keys, const IndexValue* values);
@@ -702,6 +702,14 @@ public:
     // |stat|: used for collect statistic
     virtual Status upsert(size_t n, const Slice* keys, const IndexValue* values, IndexValue* old_values,
                           IOStat* stat = nullptr);
+
+    // batch replace without return old values
+    // |n|: size of key/value array
+    // |keys|: key array as raw buffer
+    // |values|: value array
+    // |replace_indexes|: indexes of keys that need to replace
+    virtual Status replace(size_t n, const Slice* keys, const IndexValue* values,
+                           const std::vector<uint32_t>& replace_indexes);
 
     // batch insert, return error if key already exists
     // |n|: size of key/value array

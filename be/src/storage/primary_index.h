@@ -70,6 +70,17 @@ public:
     Status upsert(uint32_t rssid, uint32_t rowid_start, const Column& pks, uint32_t idx_begin, uint32_t idx_end,
                   DeletesMap* deletes);
 
+    // replace old values, and make sure key exist
+    // Used in compaction apply & publish.
+    // [not thread-safe]
+    //
+    // |rssid| output segment's rssid
+    // |rowid_start| row id left open interval
+    // |replace_indexes| replace row's index in |pks|
+    // |pks| each output segment row's *encoded* primary key
+    Status replace(uint32_t rssid, uint32_t rowid_start, const std::vector<uint32_t>& replace_indexes,
+                   const Column& pks);
+
     // TODO(qzc): maybe unused, remove it or refactor it with the methods in use by template after a period of time
     // used for compaction, try replace input rowsets' rowid with output segment's rowid, if
     // input rowsets' rowid doesn't exist, this indicates that the row of output rowset is
@@ -171,6 +182,9 @@ private:
                                                       const vector<uint32_t>& src_rssid, vector<uint32_t>* deletes);
     Status _replace_persistent_index(uint32_t rssid, uint32_t rowid_start, const Column& pks,
                                      const uint32_t max_src_rssid, vector<uint32_t>* deletes);
+
+    Status _replace_persistent_index(uint32_t rssid, uint32_t rowid_start, const std::vector<uint32_t>& indexes,
+                                     const Column& pks);
 
 protected:
     std::mutex _lock;
