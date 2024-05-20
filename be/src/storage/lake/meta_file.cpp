@@ -52,6 +52,21 @@ void MetaFileBuilder::append_delvec(const DelVectorPtr& delvec, uint32_t segment
     }
 }
 
+void MetaFileBuilder::append_dcg(uint32_t rssid, const std::vector<std::string>& filenames,
+                                 const std::vector<std::vector<ColumnUID>>& unique_column_id_list) {
+    DeltaColumnGroupPB dcg;
+    DCHECK(filenames.size() == unique_column_id_list.size());
+    for (int i = 0; i < filenames.size(); i++) {
+        dcg.add_column_files(filenames[i]);
+        DeltaColumnGroupColumnIdsPB unique_cids;
+        for (const ColumnUID uid : unique_column_id_list[i]) {
+            unique_cids.add_column_ids(uid);
+        }
+        dcg.add_column_ids()->CopyFrom(unique_cids);
+    }
+    (*_tablet_meta->mutable_dcg_meta()->mutable_dcgs())[rssid] = dcg;
+}
+
 void MetaFileBuilder::apply_opwrite(const TxnLogPB_OpWrite& op_write, const std::map<int, FileInfo>& replace_segments,
                                     const std::vector<std::string>& orphan_files) {
     auto rowset = _tablet_meta->add_rowsets();
@@ -88,6 +103,23 @@ void MetaFileBuilder::apply_opwrite(const TxnLogPB_OpWrite& op_write, const std:
         file_meta.set_name(del_file);
         _tablet_meta->mutable_orphan_files()->Add(std::move(file_meta));
     }
+}
+
+void MetaFileBuilder::apply_column_mode_partial_update(const TxnLogPB_OpWrite& op_write) {
+    auto rowset = _tablet_meta->add_rowsets();
+    rowset->CopyFrom(op_write.rowset());
+    // remove all segments that only contains partial columns.
+    for (const auto& segment : rowset->segments()) {
+        FileMetaPB file_meta;
+        file_meta.set_name(segment);
+        _tablet_meta->mutable_orphan_files()->Add(std::move(file_meta));
+    }
+    rowset->clear_segments();
+    rowset->clear_segment_size();
+    rowset->set_id(_tablet_meta->next_rowset_id());
+    rowset->set_version(_tablet_meta->version());
+    // rowset don't contain segment files, still inc next_rowset_id
+    _tablet_meta->set_next_rowset_id(_tablet_meta->next_rowset_id() + 1);
 }
 
 void MetaFileBuilder::apply_opcompaction(const TxnLogPB_OpCompaction& op_compaction,

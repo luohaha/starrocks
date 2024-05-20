@@ -18,6 +18,7 @@
 
 #include "storage/chunk_helper.h"
 #include "storage/delete_predicates.h"
+#include "storage/lake/column_mode_partial_update_handler.h"
 #include "storage/lake/tablet.h"
 #include "storage/lake/update_manager.h"
 #include "storage/projection_iterator.h"
@@ -77,6 +78,7 @@ StatusOr<std::vector<ChunkIteratorPtr>> Rowset::read(const Schema& schema, const
     if (options.is_primary_keys) {
         seg_options.is_primary_keys = true;
         seg_options.delvec_loader = std::make_shared<LakeDelvecLoader>(_tablet_mgr->update_mgr(), nullptr);
+        seg_options.dcg_loader = std::make_shared<LakeDeltaColumnGroupLoader>(_tablet_metadata);
         seg_options.version = options.version;
         seg_options.tablet_id = tablet_id();
         seg_options.rowset_id = metadata().id();
@@ -213,6 +215,7 @@ StatusOr<std::vector<ChunkIteratorPtr>> Rowset::get_each_segment_iterator_with_d
     seg_options.stats = stats;
     seg_options.is_primary_keys = true;
     seg_options.delvec_loader = std::make_shared<LakeDelvecLoader>(_tablet_mgr->update_mgr(), builder);
+    seg_options.dcg_loader = std::make_shared<LakeDeltaColumnGroupLoader>(_tablet_metadata);
     seg_options.version = version;
     seg_options.tablet_id = tablet_id();
     seg_options.rowset_id = metadata().id();

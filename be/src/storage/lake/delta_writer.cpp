@@ -74,7 +74,8 @@ public:
     explicit DeltaWriterImpl(TabletManager* tablet_manager, int64_t tablet_id, int64_t txn_id, int64_t partition_id,
                              const std::vector<SlotDescriptor*>* slots, std::string merge_condition,
                              bool miss_auto_increment_column, int64_t table_id, int64_t immutable_tablet_size,
-                             MemTracker* mem_tracker, int64_t max_buffer_size, int64_t schema_id)
+                             MemTracker* mem_tracker, int64_t max_buffer_size, int64_t schema_id,
+                             const PartialUpdateMode& partial_update_mode)
             : _tablet_manager(tablet_manager),
               _tablet_id(tablet_id),
               _txn_id(txn_id),
@@ -86,7 +87,8 @@ public:
               _max_buffer_size(max_buffer_size > 0 ? max_buffer_size : config::write_buffer_size),
               _immutable_tablet_size(immutable_tablet_size),
               _merge_condition(std::move(merge_condition)),
-              _miss_auto_increment_column(miss_auto_increment_column) {}
+              _miss_auto_increment_column(miss_auto_increment_column),
+              _partial_update_mode(partial_update_mode) {}
 
     ~DeltaWriterImpl() = default;
 
@@ -139,6 +141,8 @@ private:
 
     Status check_partial_update_with_sort_key(const Chunk& chunk);
 
+    bool is_partial_update();
+
     TabletManager* _tablet_manager;
     const int64_t _tablet_id;
     const int64_t _txn_id;
@@ -184,6 +188,8 @@ private:
     // for auto increment
     // true if miss AUTO_INCREMENT column in partial update mode
     bool _miss_auto_increment_column;
+
+    PartialUpdateMode _partial_update_mode;
     bool _partial_schema_with_sort_key = false;
 
     int64_t _last_write_ts = 0;
@@ -403,6 +409,10 @@ Status DeltaWriterImpl::init_write_schema() {
     return Status::OK();
 }
 
+bool DeltaWriterImpl::is_partial_update() {
+    return _write_schema->num_columns() < _tablet_schema->num_columns();
+}
+
 StatusOr<TxnLogPtr> DeltaWriterImpl::finish(DeltaWriterFinishMode mode) {
     SCOPED_THREAD_LOCAL_MEM_SETTER(_mem_tracker, false);
     RETURN_IF_ERROR(build_schema_and_writer());
@@ -421,7 +431,7 @@ StatusOr<TxnLogPtr> DeltaWriterImpl::finish(DeltaWriterFinishMode mode) {
     auto op_write = txn_log->mutable_op_write();
 
     for (auto& f : _tablet_writer->files()) {
-        if (is_segment(f.path)) {
+        if (is_segment(f.path) || is_upt(f.path)) {
             op_write->mutable_rowset()->add_segments(std::move(f.path));
             op_write->mutable_rowset()->add_segment_size(f.size.value());
         } else if (is_del(f.path)) {
@@ -434,25 +444,26 @@ StatusOr<TxnLogPtr> DeltaWriterImpl::finish(DeltaWriterFinishMode mode) {
     op_write->mutable_rowset()->set_data_size(_tablet_writer->data_size());
     op_write->mutable_rowset()->set_overlapped(op_write->rowset().segments_size() > 1);
 
-    const auto is_partial_update = (_write_schema->num_columns() < _tablet_schema->num_columns());
-
-    if (is_partial_update && !_merge_condition.empty()) {
+    if (is_partial_update() && !_merge_condition.empty()) {
         return Status::NotSupported("partial update and condition update at the same time");
     }
 
     // handle partial update
     RowsetTxnMetaPB* rowset_txn_meta = _tablet_writer->rowset_txn_meta();
     if (rowset_txn_meta != nullptr) {
-        if (is_partial_update) {
+        if (is_partial_update()) {
             op_write->mutable_txn_meta()->CopyFrom(*rowset_txn_meta);
             for (auto i = 0; i < _write_schema->columns().size(); ++i) {
                 const auto& tablet_column = _write_schema->column(i);
                 op_write->mutable_txn_meta()->add_partial_update_column_ids(_write_column_ids[i]);
                 op_write->mutable_txn_meta()->add_partial_update_column_unique_ids(tablet_column.unique_id());
             }
-            // generate rewrite segment names to avoid gc in rewrite operation
-            for (auto i = 0; i < op_write->rowset().segments_size(); i++) {
-                op_write->add_rewrite_segments(gen_segment_filename(_txn_id));
+            if (rowset_txn_meta->partial_update_mode() != PartialUpdateMode::COLUMN_UPSERT_MODE &&
+                rowset_txn_meta->partial_update_mode() != PartialUpdateMode::COLUMN_UPDATE_MODE) {
+                // generate rewrite segment names to avoid gc in rewrite operation
+                for (auto i = 0; i < op_write->rowset().segments_size(); i++) {
+                    op_write->add_rewrite_segments(gen_segment_filename(_txn_id));
+                }
             }
         }
         // handle condition update
@@ -715,9 +726,12 @@ StatusOr<DeltaWriterBuilder::DeltaWriterPtr> DeltaWriterBuilder::build() {
     if (UNLIKELY(_schema_id == 0)) {
         return Status::InvalidArgument("schema_id not set");
     }
+    if (UNLIKELY(_partial_update_mode == PartialUpdateMode::UNKNOWN_MODE)) {
+        return Status::InvalidArgument("partial update mode is UNKNOWN_MODE");
+    }
     auto impl = new DeltaWriterImpl(_tablet_mgr, _tablet_id, _txn_id, _partition_id, _slots, _merge_condition,
                                     _miss_auto_increment_column, _table_id, _immutable_tablet_size, _mem_tracker,
-                                    _max_buffer_size, _schema_id);
+                                    _max_buffer_size, _schema_id, _partial_update_mode);
     return std::make_unique<DeltaWriter>(impl);
 }
 
