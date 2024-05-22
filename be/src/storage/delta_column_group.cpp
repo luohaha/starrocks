@@ -118,12 +118,12 @@ Status DeltaColumnGroup::load(int64_t version, const char* data, size_t length) 
     return Status::OK();
 }
 
-Status DeltaColumnGroup::load(int64_t version, const DeltaColumnGroupPB& dcg_pb) {
+Status DeltaColumnGroup::load(int64_t version, const DeltaColumnGroupVerPB& dcg_ver_pb) {
     _version = version;
-    for (const auto& column_file : dcg_pb.column_files()) {
+    for (const auto& column_file : dcg_ver_pb.column_files()) {
         _column_files.push_back(column_file);
     }
-    for (const auto& cids : dcg_pb.column_ids()) {
+    for (const auto& cids : dcg_ver_pb.column_ids()) {
         _column_uids.emplace_back();
         for (const auto& cid : cids.column_ids()) {
             _column_uids.back().push_back(cid);

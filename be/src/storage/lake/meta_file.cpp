@@ -54,17 +54,39 @@ void MetaFileBuilder::append_delvec(const DelVectorPtr& delvec, uint32_t segment
 
 void MetaFileBuilder::append_dcg(uint32_t rssid, const std::vector<std::string>& filenames,
                                  const std::vector<std::vector<ColumnUID>>& unique_column_id_list) {
-    DeltaColumnGroupPB dcg;
+    DeltaColumnGroupVerPB& dcg_ver = (*_tablet_meta->mutable_dcg_meta()->mutable_dcgs())[rssid];
+    DeltaColumnGroupVerPB new_dcg_ver;
+    std::unordered_set<ColumnUID> need_to_remove_cuids_filter;
+
+    // 1. append new dcgs
     DCHECK(filenames.size() == unique_column_id_list.size());
     for (int i = 0; i < filenames.size(); i++) {
-        dcg.add_column_files(filenames[i]);
+        new_dcg_ver.add_column_files(filenames[i]);
         DeltaColumnGroupColumnIdsPB unique_cids;
         for (const ColumnUID uid : unique_column_id_list[i]) {
             unique_cids.add_column_ids(uid);
+            // Build filter so we can remove old columns at second step.
+            need_to_remove_cuids_filter.insert(uid);
         }
-        dcg.add_column_ids()->CopyFrom(unique_cids);
+        new_dcg_ver.add_column_ids()->CopyFrom(unique_cids);
+        new_dcg_ver.add_versions();
     }
-    (*_tablet_meta->mutable_dcg_meta()->mutable_dcgs())[rssid] = dcg;
+    // 2. remove old dcgs
+    DCHECK(dcg_ver.column_ids_size() == dcg_ver.column_files_size());
+    DCHECK(dcg_ver.column_ids_size() == dcg_ver.versions_size());
+    for (int i = 0; i < dcg_ver.column_ids_size(); i++) {
+        auto* mcids = dcg_ver.mutable_column_ids(i)->mutable_column_ids();
+        mcids->erase(std::remove_if(mcids->begin(), mcids->end(),
+                                    [&](uint32 cuid) { return need_to_remove_cuids_filter.count(cuid) > 0; }),
+                     mcids->end());
+        if (!mcids->empty()) {
+            new_dcg_ver->add_column_ids()->CopyFrom(dcg_ver.column_ids(i));
+            new_dcg_ver->add_column_files(dcg_ver.column_files(i));
+            new_dcg_ver.add_versions(dcg_ver.versions(i));
+        }
+    }
+
+    (*_tablet_meta->mutable_dcg_meta()->mutable_dcgs())[rssid] = new_dcg_ver;
 }
 
 void MetaFileBuilder::apply_opwrite(const TxnLogPB_OpWrite& op_write, const std::map<int, FileInfo>& replace_segments,
@@ -106,20 +128,12 @@ void MetaFileBuilder::apply_opwrite(const TxnLogPB_OpWrite& op_write, const std:
 }
 
 void MetaFileBuilder::apply_column_mode_partial_update(const TxnLogPB_OpWrite& op_write) {
-    auto rowset = _tablet_meta->add_rowsets();
-    rowset->CopyFrom(op_write.rowset());
     // remove all segments that only contains partial columns.
-    for (const auto& segment : rowset->segments()) {
+    for (const auto& segment : op_write.rowset().segments()) {
         FileMetaPB file_meta;
         file_meta.set_name(segment);
         _tablet_meta->mutable_orphan_files()->Add(std::move(file_meta));
     }
-    rowset->clear_segments();
-    rowset->clear_segment_size();
-    rowset->set_id(_tablet_meta->next_rowset_id());
-    rowset->set_version(_tablet_meta->version());
-    // rowset don't contain segment files, still inc next_rowset_id
-    _tablet_meta->set_next_rowset_id(_tablet_meta->next_rowset_id() + 1);
 }
 
 void MetaFileBuilder::apply_opcompaction(const TxnLogPB_OpCompaction& op_compaction,

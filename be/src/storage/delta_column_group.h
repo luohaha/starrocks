@@ -36,7 +36,7 @@ public:
     void init(int64_t version, const std::vector<std::vector<ColumnUID>>& column_ids,
               const std::vector<std::string>& column_files);
     Status load(int64_t version, const char* data, size_t length);
-    Status load(int64_t version, const DeltaColumnGroupPB& dcg_pb);
+    Status load(int64_t version, const DeltaColumnGroupVerPB& dcg_ver_pb);
     std::string save() const;
     // merge this dcg into dst dcgs by version, returns the number of successful merges
     int merge_into_by_version(DeltaColumnGroupList& dcgs, const std::string& dir, const RowsetId& rowset_id,
