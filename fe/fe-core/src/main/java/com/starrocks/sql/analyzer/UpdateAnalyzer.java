@@ -82,24 +82,22 @@ public class UpdateAnalyzer {
             }
         }
 
-        if (table.isOlapTable()) {
-            if (session.getSessionVariable().getPartialUpdateMode().equals("column")) {
-                // use partial update by column
-                updateStmt.setUsePartialUpdate();
-                if (((OlapTable) table).hasRowStorageType()) {
-                    throw new SemanticException("column_with_row table do not support column mode update");
-                }
-            } else if (session.getSessionVariable().getPartialUpdateMode().equals("auto")) {
-                // decide by default rules
-                if (updateStmt.getWherePredicate() == null) {
-                    if (checkIfUsePartialUpdate(assignmentList.size(), table.getBaseSchema().size())) {
-                        if (!((OlapTable) table).hasRowStorageType()) {
-                            // use partial update if:
-                            // 1. Columns updated are less than 4
-                            // 2. The proportion of columns updated is less than 30%
-                            // 3. No where predicate in update stmt
-                            updateStmt.setUsePartialUpdate();
-                        }
+        if (session.getSessionVariable().getPartialUpdateMode().equals("column")) {
+            // use partial update by column
+            updateStmt.setUsePartialUpdate();
+            if (((OlapTable) table).hasRowStorageType()) {
+                throw new SemanticException("column_with_row table do not support column mode update");
+            }
+        } else if (session.getSessionVariable().getPartialUpdateMode().equals("auto")) {
+            // decide by default rules
+            if (updateStmt.getWherePredicate() == null) {
+                if (checkIfUsePartialUpdate(assignmentList.size(), table.getBaseSchema().size())) {
+                    if (!((OlapTable) table).hasRowStorageType()) {
+                        // use partial update if:
+                        // 1. Columns updated are less than 4
+                        // 2. The proportion of columns updated is less than 30%
+                        // 3. No where predicate in update stmt
+                        updateStmt.setUsePartialUpdate();
                     }
                 }
             }
