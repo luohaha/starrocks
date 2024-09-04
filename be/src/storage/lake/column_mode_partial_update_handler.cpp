@@ -60,6 +60,52 @@ Status LakeDeltaColumnGroupLoader::load(int64_t tablet_id, RowsetId rowsetid, ui
     return Status::NotSupported("LakeDeltaColumnGroupLoader::load not supported");
 }
 
+Status GetDeltaColumnContext::prepare(std::shared_ptr<Segment> seg, const TabletMetadataPtr& tablet_metadata,
+                                      const TabletSegmentId& tsid, int64_t read_version) {
+    _segment = std::move(seg);
+    auto dcg_loader = std::make_unique<LakeDeltaColumnGroupLoader>(tablet_metadata);
+    RETURN_IF_ERROR(dcg_loader->load(tsid, read_version, &_dcgs));
+    return Status::OK();
+}
+
+StatusOr<std::shared_ptr<Segment>> GetDeltaColumnContext::_get_dcg_segment(
+        uint32_t ucid, int32_t* col_index, const TabletSchemaCSPtr& read_tablet_schema) {
+    // iterate dcg from new ver to old ver
+    for (const auto& dcg : _dcgs) {
+        std::pair<int32_t, int32_t> idx = dcg->get_column_idx(ucid);
+        if (idx.first >= 0) {
+            std::string column_file = dcg->column_files(parent_name(_segment->file_name()))[idx.first];
+            if (_dcg_segments.count(column_file) == 0) {
+                ASSIGN_OR_RETURN(auto dcg_segment, _segment->new_dcg_segment(*dcg, idx.first, read_tablet_schema));
+                _dcg_segments[column_file] = dcg_segment;
+            }
+            if (col_index != nullptr) {
+                *col_index = idx.second;
+            }
+            return _dcg_segments[column_file];
+        }
+    }
+    // the column not exist in delta column group
+    return nullptr;
+}
+
+StatusOr<std::unique_ptr<ColumnIterator>> GetDeltaColumnContext::new_dcg_column_iterator(
+        const std::shared_ptr<FileSystem>& fs, ColumnIteratorOptions& iter_opts, const TabletColumn& column,
+        const TabletSchemaCSPtr& read_tablet_schema) {
+    // build column iter from delta column group
+    int32_t col_index = 0;
+    ASSIGN_OR_RETURN(auto dcg_segment, _get_dcg_segment(column.unique_id(), &col_index, read_tablet_schema));
+    if (dcg_segment != nullptr) {
+        if (_dcg_read_files.count(dcg_segment->file_name()) == 0) {
+            ASSIGN_OR_RETURN(auto read_file, fs->new_random_access_file(dcg_segment->file_info()));
+            _dcg_read_files[dcg_segment->file_name()] = std::move(read_file);
+        }
+        iter_opts.read_file = _dcg_read_files[dcg_segment->file_name()].get();
+        return dcg_segment->new_column_iterator(column, nullptr);
+    }
+    return nullptr;
+}
+
 ColumnModePartialUpdateHandler::ColumnModePartialUpdateHandler(int64_t base_version, int64_t txn_id,
                                                                MemTracker* tracker)
         : _base_version(base_version), _txn_id(txn_id), _tracker(tracker) {}
@@ -257,7 +303,7 @@ StatusOr<ChunkPtr> ColumnModePartialUpdateHandler::_read_from_source_segment(con
     if (relative_file_info.size.has_value()) {
         fileinfo.size = relative_file_info.size;
     }
-    uint32_t rowset_id = params.container.rssid_to_rowid().at(rssid);
+    uint32_t rowset_id = params.container.rssid_to_rowsetid().at(rssid);
     // 2. load segment meta.
     ASSIGN_OR_RETURN(auto segment, params.tablet->tablet_mgr()->load_segment(
                                            fileinfo, rssid - rowset_id /* segment id inside rowset */,

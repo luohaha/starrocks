@@ -79,13 +79,13 @@ public:
                            const std::map<int, FileInfo>& replace_segments);
 
     const std::unordered_map<uint32_t, FileInfo>& rssid_to_file() const { return _rssid_to_file_info; }
-    const std::unordered_map<uint32_t, uint32_t>& rssid_to_rowid() const { return _rssid_to_rowid; }
+    const std::unordered_map<uint32_t, uint32_t>& rssid_to_rowsetid() const { return _rssid_to_rowsetid; }
 
 private:
     // From rowset segment id to segment file
     std::unordered_map<uint32_t, FileInfo> _rssid_to_file_info;
     // From rowset segment id to rowset id
-    std::unordered_map<uint32_t, uint32_t> _rssid_to_rowid;
+    std::unordered_map<uint32_t, uint32_t> _rssid_to_rowsetid;
 };
 
 class UpdateManager {

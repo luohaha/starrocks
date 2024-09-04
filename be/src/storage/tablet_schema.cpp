@@ -364,6 +364,12 @@ std::shared_ptr<TabletSchema> TabletSchema::create(const TabletSchemaCSPtr& src_
     return std::make_shared<TabletSchema>(partial_tablet_schema_pb);
 }
 
+std::shared_ptr<TabletSchema> TabletSchema::create(const TabletSchemaCSPtr& tablet_schema,
+                                                   const std::vector<ColumnId>& column_ids) {
+    std::vector<int32_t> referenced_column_ids(column_ids.begin(), column_ids.end());
+    return create(tablet_schema, referenced_column_ids);
+}
+
 std::shared_ptr<TabletSchema> TabletSchema::create_with_uid(const TabletSchemaCSPtr& tablet_schema,
                                                             const std::vector<ColumnUID>& unique_column_ids) {
     std::unordered_set<int32_t> unique_cid_filter(unique_column_ids.begin(), unique_column_ids.end());

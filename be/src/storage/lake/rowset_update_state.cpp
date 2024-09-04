@@ -262,14 +262,14 @@ Status RowsetUpdateState::_prepare_auto_increment_partial_update_states(uint32_t
     CHECK_MEM_LIMIT("RowsetUpdateState::_prepare_auto_increment_partial_update_states");
     const auto& txn_meta = params.op_write.txn_meta();
 
-    uint32_t auto_increment_column_id = 0;
+    int32_t auto_increment_column_id = 0;
     for (int i = 0; i < params.tablet_schema->num_columns(); ++i) {
         if (params.tablet_schema->column(i).is_auto_increment()) {
             auto_increment_column_id = i;
             break;
         }
     }
-    std::vector<uint32_t> column_id{auto_increment_column_id};
+    std::vector<int32_t> column_id{auto_increment_column_id};
     auto auto_inc_column_schema = ChunkHelper::convert_schema(params.tablet_schema, column_id);
     auto column = ChunkHelper::column_from_field(*auto_inc_column_schema.field(0).get());
     std::vector<std::unique_ptr<Column>> read_column;

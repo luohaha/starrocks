@@ -31,6 +31,31 @@ private:
     TabletMetadataPtr _tablet_metadata;
 };
 
+// save the context when reading from delta column files
+class GetDeltaColumnContext {
+public:
+    // prepare `GetDeltaColumnContext`
+    Status prepare(std::shared_ptr<Segment> seg, const TabletMetadataPtr& tablet_metadata, const TabletSegmentId& tsid,
+                   int64_t read_version);
+    // create iterator via `GetDeltaColumnContext`
+    StatusOr<std::unique_ptr<ColumnIterator>> new_dcg_column_iterator(const std::shared_ptr<FileSystem>& fs,
+                                                                      ColumnIteratorOptions& iter_opts,
+                                                                      const TabletColumn& column,
+                                                                      const TabletSchemaCSPtr& read_tablet_schema);
+
+private:
+    StatusOr<std::shared_ptr<Segment>> GetDeltaColumnContext::_get_dcg_segment(
+            uint32_t ucid, int32_t* col_index, const TabletSchemaCSPtr& read_tablet_schema);
+
+    DeltaColumnGroupList _dcgs;
+    // from delta column filename to segment
+    std::unordered_map<std::string, std::shared_ptr<Segment>> _dcg_segments;
+    // from delta column filename to read file
+    std::unordered_map<std::string, std::unique_ptr<RandomAccessFile>> _dcg_read_files;
+    // main segment
+    std::shared_ptr<Segment> _segment;
+};
+
 // Used in column mode partial update
 class ColumnModePartialUpdateHandler {
 public:

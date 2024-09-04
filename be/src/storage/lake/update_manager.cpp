@@ -106,7 +106,7 @@ void RssidFileInfoContainer::add_rssid_to_file(const TabletMetadata& metadata) {
                 segment_info.encryption_meta = rs.segment_encryption_metas(i);
             }
             _rssid_to_file_info[rs.id() + i] = segment_info;
-            _rssid_to_rowid[rs.id() + i] = rs.id();
+            _rssid_to_rowsetid[rs.id() + i] = rs.id();
         }
     }
 }
@@ -117,7 +117,7 @@ void RssidFileInfoContainer::add_rssid_to_file(const RowsetMetadataPB& meta, uin
     if (replace_segments.count(segment_id) > 0) {
         // partial update
         _rssid_to_file_info[rowset_id + segment_id] = replace_segments.at(segment_id);
-        _rssid_to_rowid[rowset_id + segment_id] = rowset_id;
+        _rssid_to_rowsetid[rowset_id + segment_id] = rowset_id;
     } else {
         bool has_segment_size = (meta.segments_size() == meta.segment_size_size());
         bool has_encryption_meta = (meta.segments_size() == meta.segment_encryption_metas_size());
@@ -129,7 +129,7 @@ void RssidFileInfoContainer::add_rssid_to_file(const RowsetMetadataPB& meta, uin
             segment_info.encryption_meta = meta.segment_encryption_metas(segment_id);
         }
         _rssid_to_file_info[rowset_id + segment_id] = segment_info;
-        _rssid_to_rowid[rowset_id + segment_id] = rowset_id;
+        _rssid_to_rowsetid[rowset_id + segment_id] = rowset_id;
     }
 }
 
@@ -518,7 +518,7 @@ Status UpdateManager::get_column_values(const RowsetUpdateStateParams& params, s
     watch.reset();
 
     std::shared_ptr<FileSystem> fs;
-    auto fetch_values_from_segment = [&](const FileInfo& segment_info, uint32_t segment_id,
+    auto fetch_values_from_segment = [&](const FileInfo& segment_info, uint32_t rssid, uint32_t segment_id,
                                          const TabletSchemaCSPtr& tablet_schema, const std::vector<uint32_t>& rowids,
                                          const std::vector<uint32_t>& read_column_ids) -> Status {
         FileInfo file_info{.path = params.tablet->segment_location(segment_info.path),
@@ -528,14 +528,18 @@ Status UpdateManager::get_column_values(const RowsetUpdateStateParams& params, s
         }
         auto segment = Segment::open(fs, file_info, segment_id, tablet_schema);
         if (!segment.ok()) {
-            LOG(WARNING) << "Fail to open rssid: " << segment_id << " path: " << file_info.path << " : "
-                         << segment.status();
+            LOG(WARNING) << "Fail to open rssid: " << rssid << " path: " << file_info.path << " : " << segment.status();
             return segment.status();
         }
         if ((*segment)->num_rows() == 0) {
             return Status::OK();
         }
 
+        // used for read from dcg files if exist.
+        GetDeltaColumnContext dcg_context;
+        RETURN_IF_ERROR(dcg_context.prepare(segment, params.metadata, TabletSegmentId(params.metadata->id(), rssid),
+                                            params.metadata->version()));
+        TabletSchemaCSPtr read_tablet_schema = create(tablet_schema, read_column_ids);
         RandomAccessFileOptions opts;
         if (!file_info.encryption_meta.empty()) {
             ASSIGN_OR_RETURN(auto info, KeyCache::instance().unwrap_encryption_meta(file_info.encryption_meta));
@@ -545,10 +549,17 @@ Status UpdateManager::get_column_values(const RowsetUpdateStateParams& params, s
         OlapReaderStatistics stats;
         iter_opts.stats = &stats;
         ASSIGN_OR_RETURN(auto read_file, fs->new_random_access_file(opts, file_info));
-        iter_opts.read_file = read_file.get();
         for (auto i = 0; i < read_column_ids.size(); ++i) {
             const TabletColumn& col = tablet_schema->column(read_column_ids[i]);
-            ASSIGN_OR_RETURN(auto col_iter, (*segment)->new_column_iterator_or_default(col, nullptr));
+            // try to build iterator from delta column file first
+            ASSIGN_OR_RETURN(auto col_iter,
+                             dcg_context.new_dcg_column_iterator(fs, iter_opts, col,
+                                                                 read_tablet_schema /* table schema of read column*/));
+            if (col_iter == nullptr) {
+                // not found in delta column file, build iterator from main segment
+                ASSIGN_OR_RETURN(col_iter, (*segment)->new_column_iterator_or_default(col, nullptr));
+                iter_opts.read_file = read_file.get();
+            }
             RETURN_IF_ERROR(col_iter->init(iter_opts));
             RETURN_IF_ERROR(col_iter->fetch_values_by_rowid(rowids.data(), rowids.size(), (*columns)[i].get()));
         }
@@ -567,8 +578,8 @@ Status UpdateManager::get_column_values(const RowsetUpdateStateParams& params, s
                                                  params.metadata->id(), params.metadata->version(), rssid));
         }
         // use 0 segment_id is safe, because we need not get either delvector or dcg here
-        RETURN_IF_ERROR(fetch_values_from_segment(params.container.rssid_to_file().at(rssid), 0, params.tablet_schema,
-                                                  rowids, column_ids));
+        RETURN_IF_ERROR(fetch_values_from_segment(params.container.rssid_to_file().at(rssid), rssid, 0,
+                                                  params.tablet_schema, rowids, column_ids));
     }
     if (auto_increment_state != nullptr && with_default) {
         if (fs == nullptr) {
@@ -583,7 +594,7 @@ Status UpdateManager::get_column_values(const RowsetUpdateStateParams& params, s
         if (segment_id < params.op_write.rowset().segment_encryption_metas_size()) {
             info.encryption_meta = params.op_write.rowset().segment_encryption_metas(segment_id);
         }
-        RETURN_IF_ERROR(fetch_values_from_segment(info, segment_id,
+        RETURN_IF_ERROR(fetch_values_from_segment(info, params.op_write.rowset().id(), segment_id,
                                                   // use partial segment column offset id to get the column
                                                   auto_increment_state->schema, rowids, auto_increment_col_partial_id));
     }
