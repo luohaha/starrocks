@@ -391,6 +391,9 @@ Status SchemaChangeHandler::do_process_update_tablet_meta(const TTabletMetaInfo&
     if (tablet_meta_info.__isset.enable_persistent_index) {
         metadata_update_info->set_enable_persistent_index(tablet_meta_info.enable_persistent_index);
     }
+    if (tablet_meta_info.__isset.persistent_index_type) {
+        metadata_update_info->set_persistent_index_type(tablet_meta_info.persistent_index_type);
+    }
     if (tablet_meta_info.__isset.tablet_schema) {
         // FIXME: pass compression type
         auto compression_type = TCompressionType::LZ4_FRAME;
