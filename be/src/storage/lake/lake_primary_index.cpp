@@ -298,4 +298,28 @@ Status LakePrimaryIndex::erase(const TabletMetadataPtr& metadata, const Column& 
     }
 }
 
+Status LakePrimaryIndex::begin_mem_bypass() {
+    if (!_enable_persistent_index) {
+        return Status::OK();
+    }
+
+    auto* lake_persistent_index = dynamic_cast<LakePersistentIndex*>(_persistent_index.get());
+    if (lake_persistent_index != nullptr) {
+        return lake_persistent_index->begin_mem_bypass();
+    }
+    return Status::OK();
+}
+
+Status LakePrimaryIndex::finish_mem_bypass() {
+    if (!_enable_persistent_index) {
+        return Status::OK();
+    }
+
+    auto* lake_persistent_index = dynamic_cast<LakePersistentIndex*>(_persistent_index.get());
+    if (lake_persistent_index != nullptr) {
+        return lake_persistent_index->finish_mem_bypass();
+    }
+    return Status::OK();
+}
+
 } // namespace starrocks::lake

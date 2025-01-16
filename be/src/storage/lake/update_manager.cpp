@@ -376,11 +376,23 @@ Status UpdateManager::publish_column_mode_partial_update(const TxnLogPB_OpWrite&
 }
 
 Status UpdateManager::_do_update(uint32_t rowset_id, int32_t upsert_idx, const SegmentPKEncodeResultPtr& upsert,
-                                 PrimaryIndex& index, DeletesMap* new_deletes) {
+                                 LakePrimaryIndex& index, DeletesMap* new_deletes) {
     TRACE_COUNTER_SCOPE_LATENCY_US("do_update_latency_us");
+    bool bypass_cloud_native_index_memtable = false;
+    if (upsert->memory_usage() >= config::l0_max_mem_usage * 2) {
+        // It means this upsert will cause memtable flush twice.
+        // It's better to bypass memtable and write to sstable directly.
+        bypass_cloud_native_index_memtable = true;
+    }
+    if (bypass_cloud_native_index_memtable) {
+        RETURN_IF_ERROR(index.begin_mem_bypass());
+    }
     for (; !upsert->done(); upsert->next()) {
         auto current = upsert->current();
         RETURN_IF_ERROR(index.upsert(rowset_id + upsert_idx, current.second, *current.first, new_deletes));
+    }
+    if (bypass_cloud_native_index_memtable) {
+        RETURN_IF_ERROR(index.finish_mem_bypass());
     }
     return upsert->status();
 }

@@ -17,6 +17,8 @@
 #include "storage/lake/tablet_metadata.h"
 #include "storage/lake/types_fwd.h"
 #include "storage/persistent_index.h"
+#include "storage/sstable/filter_policy.h"
+#include "storage/sstable/table_builder.h"
 
 namespace starrocks {
 class TxnLogPB;
@@ -24,7 +26,6 @@ class TxnLogPB_OpCompaction;
 
 namespace sstable {
 class Iterator;
-class TableBuilder;
 } // namespace sstable
 
 namespace lake {
@@ -59,6 +60,30 @@ private:
     std::list<IndexValueWithVer> _index_value_vers;
     // If do merge base level, that means we can delete NullIndexValue items safely.
     bool _merge_base_level = false;
+};
+
+class MemtableBypassHelper {
+public:
+    explicit MemtableBypassHelper() {}
+
+    Status init(TabletManager* tablet_mgr, int64_t tablet_id);
+
+    Status upsert(size_t n, const Slice* keys, const IndexValue* values, int64_t version);
+
+    StatusOr<std::unique_ptr<PersistentIndexSstable>> finish();
+
+private:
+    TabletManager* _tablet_mgr;
+    std::string _key; // used for merge same keys in one file.
+    std::string _val; // used for merge same keys in one file.
+    std::string _filename;
+    std::string _location;
+    std::string _encryption_meta;
+    FileEncryptionInfo _encryption_info;
+    std::unique_ptr<sstable::FilterPolicy> _filter_policy;
+    std::unique_ptr<WritableFile> _wf;
+    std::unique_ptr<sstable::TableBuilder> _builder;
+    uint64_t _max_rss_rowid = 0;
 };
 
 // LakePersistentIndex is not thread-safe.
@@ -146,6 +171,11 @@ public:
 
     size_t memory_usage() const override;
 
+    // Used to bypass memtable when handle bulk upsert
+    Status begin_mem_bypass();
+
+    Status finish_mem_bypass();
+
     static void pick_sstables_for_merge(const PersistentIndexSstableMetaPB& sstable_meta,
                                         std::vector<PersistentIndexSstablePB>* sstables, bool* merge_base_level);
 
@@ -195,6 +225,8 @@ private:
     // In major compaction, some sstables will be picked to be merged into one.
     // sstables are ordered with the smaller version on the left.
     std::vector<std::unique_ptr<PersistentIndexSstable>> _sstables;
+    // Used to bypass memtable when handle bulk upsert
+    std::unique_ptr<MemtableBypassHelper> _mem_bypass_helper;
 };
 
 } // namespace lake

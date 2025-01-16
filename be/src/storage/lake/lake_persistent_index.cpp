@@ -128,6 +128,79 @@ void KeyValueMerger::flush() {
     _index_value_vers.clear();
 }
 
+Status MemtableBypassHelper::init(TabletManager* tablet_mgr, int64_t tablet_id) {
+    _tablet_mgr = tablet_mgr;
+    _filename = gen_sst_filename();
+    _location = _tablet_mgr->sst_location(tablet_id, _filename);
+    WritableFileOptions wopts;
+    if (config::enable_transparent_data_encryption) {
+        ASSIGN_OR_RETURN(auto pair, KeyCache::instance().create_encryption_meta_pair_using_current_kek());
+        wopts.encryption_info = pair.info;
+        _encryption_info = pair.info;
+        _encryption_meta.swap(pair.encryption_meta);
+    }
+    ASSIGN_OR_RETURN(_wf, fs::new_writable_file(wopts, _location));
+    sstable::Options options;
+    _filter_policy.reset(const_cast<sstable::FilterPolicy*>(sstable::NewBloomFilterPolicy(10)));
+    options.filter_policy = _filter_policy.get();
+    _builder = std::make_unique<sstable::TableBuilder>(options, _wf.get());
+    return Status::OK();
+}
+
+Status MemtableBypassHelper::upsert(size_t n, const Slice* keys, const IndexValue* values, int64_t version) {
+    TRACE_COUNTER_SCOPE_LATENCY_US("bulk_upsert_latency_us");
+    for (size_t i = 0; i < n; ++i) {
+        IndexValuesWithVerPB index_value_ver;
+        auto* value = index_value_ver.add_values();
+        value->set_version(version);
+        value->set_rssid(values[i].get_rssid());
+        value->set_rowid(values[i].get_rowid());
+        _max_rss_rowid = std::max(_max_rss_rowid, values[i].get_value());
+        if (_key.empty()) {
+            _key = keys[i].to_string();
+            _val = index_value_ver.SerializeAsString();
+        } else if (Slice(_key) != keys[i]) {
+            _builder->Add(_key, _val);
+            _key = keys[i].to_string();
+            _val = index_value_ver.SerializeAsString();
+        } else {
+            // same keys, replace previous val
+            _val = index_value_ver.SerializeAsString();
+        }
+    }
+    return Status::OK();
+}
+
+StatusOr<std::unique_ptr<PersistentIndexSstable>> MemtableBypassHelper::finish() {
+    if (!_key.empty()) {
+        // Last item
+        _builder->Add(_key, _val);
+    }
+
+    TRACE_COUNTER_SCOPE_LATENCY_US("bulk_upsert_finish_latency_us");
+    RETURN_IF_ERROR(_builder->Finish());
+    uint64_t filesize = _builder->FileSize();
+    RETURN_IF_ERROR(_wf->close());
+
+    auto sstable = std::make_unique<PersistentIndexSstable>();
+    RandomAccessFileOptions opts;
+    if (!_encryption_meta.empty()) {
+        opts.encryption_info = _encryption_info;
+    }
+    ASSIGN_OR_RETURN(auto rf, fs::new_random_access_file(opts, _location));
+    PersistentIndexSstablePB sstable_pb;
+    sstable_pb.set_filename(_filename);
+    sstable_pb.set_filesize(filesize);
+    sstable_pb.set_max_rss_rowid(_max_rss_rowid);
+    sstable_pb.set_encryption_meta(_encryption_meta);
+    auto* block_cache = _tablet_mgr->update_mgr()->block_cache();
+    if (block_cache == nullptr) {
+        return Status::InternalError("Block cache is null.");
+    }
+    RETURN_IF_ERROR(sstable->init(std::move(rf), sstable_pb, block_cache->cache()));
+    return std::move(sstable);
+}
+
 LakePersistentIndex::LakePersistentIndex(TabletManager* tablet_mgr, int64_t tablet_id)
         : PersistentIndex(""), _tablet_mgr(tablet_mgr), _tablet_id(tablet_id) {}
 
@@ -232,6 +305,24 @@ Status LakePersistentIndex::flush_memtable() {
     return Status::OK();
 }
 
+Status LakePersistentIndex::begin_mem_bypass() {
+    _mem_bypass_helper = std::make_unique<MemtableBypassHelper>();
+    RETURN_IF_ERROR(_mem_bypass_helper->init(_tablet_mgr, _tablet_id));
+    return Status::OK();
+}
+
+Status LakePersistentIndex::finish_mem_bypass() {
+    // 1. flush current memtable
+    if (!_memtable->empty()) {
+        RETURN_IF_ERROR(flush_memtable());
+    }
+    // 2. finish, and get sstable
+    ASSIGN_OR_RETURN(auto sstable, _mem_bypass_helper->finish());
+    _mem_bypass_helper.reset();
+    _sstables.emplace_back(std::move(sstable));
+    return Status::OK();
+}
+
 Status LakePersistentIndex::get_from_sstables(size_t n, const Slice* keys, IndexValue* values, KeyIndexSet* key_indexes,
                                               int64_t version) const {
     if (key_indexes->empty() || _sstables.empty()) {
@@ -259,6 +350,11 @@ Status LakePersistentIndex::get(size_t n, const Slice* keys, IndexValue* values)
 
 Status LakePersistentIndex::upsert(size_t n, const Slice* keys, const IndexValue* values, IndexValue* old_values,
                                    IOStat* stat) {
+    if (_mem_bypass_helper != nullptr) {
+        // Bypass memtable
+        RETURN_IF_ERROR(_mem_bypass_helper->upsert(n, keys, values, _version.major_number()));
+        return get(n, keys, old_values);
+    }
     std::set<KeyIndex> not_founds;
     size_t num_found;
     RETURN_IF_ERROR(_memtable->upsert(n, keys, values, old_values, &not_founds, &num_found, _version.major_number()));
