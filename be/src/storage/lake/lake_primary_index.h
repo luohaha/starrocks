@@ -28,6 +28,7 @@ namespace lake {
 class Tablet;
 class MetaFileBuilder;
 class TabletManager;
+class MemtableBypassGuard;
 
 class LakePrimaryIndex : public PrimaryIndex {
 public:
@@ -84,10 +85,7 @@ public:
     // |rowset_id| The rowset that keys belong to. Used for setup rebuild point (cloud native index only).
     Status erase(const TabletMetadataPtr& metadata, const Column& pks, DeletesMap* deletes, uint32_t rowset_id);
 
-    // Used to bypass memtable when handle bulk upsert. Only used in cloud native PK index.
-    Status begin_mem_bypass();
-
-    Status finish_mem_bypass();
+    std::unique_ptr<MemtableBypassGuard> get_memtable_bypass_helper_guard();
 
 private:
     Status _do_lake_load(TabletManager* tablet_mgr, const TabletMetadataPtr& metadata, int64_t base_version,

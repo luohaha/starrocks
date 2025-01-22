@@ -156,6 +156,7 @@ Status MemtableBypassHelper::upsert(size_t n, const Slice* keys, const IndexValu
         value->set_rssid(values[i].get_rssid());
         value->set_rowid(values[i].get_rowid());
         _max_rss_rowid = std::max(_max_rss_rowid, values[i].get_value());
+        LOG(INFO) << "upsert " << starrocks::hexdump(keys[i].data, keys[i].size);
         if (_key.empty()) {
             _key = keys[i].to_string();
             _val = index_value_ver.SerializeAsString();
@@ -199,6 +200,23 @@ StatusOr<std::unique_ptr<PersistentIndexSstable>> MemtableBypassHelper::finish()
     }
     RETURN_IF_ERROR(sstable->init(std::move(rf), sstable_pb, block_cache->cache()));
     return std::move(sstable);
+}
+
+Status MemtableBypassGuard::begin() {
+    _index->_mem_bypass_helper = std::make_unique<MemtableBypassHelper>();
+    RETURN_IF_ERROR(_index->_mem_bypass_helper->init(_index->_tablet_mgr, _index->_tablet_id));
+    return Status::OK();
+}
+
+Status MemtableBypassGuard::finish() {
+    // 1. flush current memtable
+    if (!_index->_memtable->empty()) {
+        RETURN_IF_ERROR(_index->flush_memtable());
+    }
+    // 2. generate sstable
+    ASSIGN_OR_RETURN(auto sstable, _index->_mem_bypass_helper->finish());
+    _index->_sstables.emplace_back(std::move(sstable));
+    return Status::OK();
 }
 
 LakePersistentIndex::LakePersistentIndex(TabletManager* tablet_mgr, int64_t tablet_id)
@@ -302,24 +320,6 @@ Status LakePersistentIndex::flush_memtable() {
     _memtable = std::make_unique<PersistentIndexMemtable>(max_rss_rowid);
     // Reset rebuild file count, avoid useless flush.
     _need_rebuild_file_cnt = 0;
-    return Status::OK();
-}
-
-Status LakePersistentIndex::begin_mem_bypass() {
-    _mem_bypass_helper = std::make_unique<MemtableBypassHelper>();
-    RETURN_IF_ERROR(_mem_bypass_helper->init(_tablet_mgr, _tablet_id));
-    return Status::OK();
-}
-
-Status LakePersistentIndex::finish_mem_bypass() {
-    // 1. flush current memtable
-    if (!_memtable->empty()) {
-        RETURN_IF_ERROR(flush_memtable());
-    }
-    // 2. finish, and get sstable
-    ASSIGN_OR_RETURN(auto sstable, _mem_bypass_helper->finish());
-    _mem_bypass_helper.reset();
-    _sstables.emplace_back(std::move(sstable));
     return Status::OK();
 }
 

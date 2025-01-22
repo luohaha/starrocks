@@ -1921,6 +1921,42 @@ TEST_P(LakePrimaryKeyPublishTest, test_publish_with_lazy_load) {
     }
 }
 
+TEST_P(LakePrimaryKeyPublishTest, test_cloud_native_index_bypass_memtable) {
+    if (!GetParam().enable_persistent_index ||
+        GetParam().persistent_index_type != PersistentIndexTypePB::CLOUD_NATIVE) {
+        GTEST_SKIP() << "this case only for cloud native index";
+        return;
+    }
+    const size_t N = 40000;
+    auto [chunk0, indexes] = gen_data_and_index(N, 0, true, true);
+    auto version = 1;
+    auto tablet_id = _tablet_metadata->id();
+    int64_t old_val = config::l0_max_mem_usage;
+    config::l0_max_mem_usage = 1;
+    for (int i = 0; i < 3; i++) {
+        int64_t txn_id = next_id();
+        ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                                   .set_tablet_manager(_tablet_mgr.get())
+                                                   .set_tablet_id(tablet_id)
+                                                   .set_txn_id(txn_id)
+                                                   .set_partition_id(_partition_id)
+                                                   .set_mem_tracker(_mem_tracker.get())
+                                                   .set_schema_id(_tablet_schema->id())
+                                                   .build());
+        ASSERT_OK(delta_writer->open());
+        ASSERT_OK(delta_writer->write(*chunk0, indexes.data(), indexes.size()));
+        ASSERT_OK(delta_writer->finish_with_txnlog());
+        delta_writer->close();
+        ASSERT_OK(publish_single_version(tablet_id, version + 1, txn_id).status());
+        version++;
+    }
+    config::l0_max_mem_usage = old_val;
+    ASSERT_EQ(N, read_rows(tablet_id, version));
+    if (GetParam().enable_persistent_index && GetParam().persistent_index_type == PersistentIndexTypePB::LOCAL) {
+        check_local_persistent_index_meta(tablet_id, version);
+    }
+}
+
 INSTANTIATE_TEST_SUITE_P(LakePrimaryKeyPublishTest, LakePrimaryKeyPublishTest,
                          ::testing::Values(PrimaryKeyParam{true}, PrimaryKeyParam{false},
                                            PrimaryKeyParam{true, PersistentIndexTypePB::CLOUD_NATIVE},

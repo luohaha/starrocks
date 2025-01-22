@@ -73,7 +73,7 @@ public:
     StatusOr<std::unique_ptr<PersistentIndexSstable>> finish();
 
 private:
-    TabletManager* _tablet_mgr;
+    TabletManager* _tablet_mgr = nullptr;
     std::string _key; // used for merge same keys in one file.
     std::string _val; // used for merge same keys in one file.
     std::string _filename;
@@ -89,6 +89,8 @@ private:
 // LakePersistentIndex is not thread-safe.
 // Caller should take care of the multi-thread safety
 class LakePersistentIndex : public PersistentIndex {
+    friend class MemtableBypassGuard;
+
 public:
     explicit LakePersistentIndex(TabletManager* tablet_mgr, int64_t tablet_id);
 
@@ -171,11 +173,6 @@ public:
 
     size_t memory_usage() const override;
 
-    // Used to bypass memtable when handle bulk upsert
-    Status begin_mem_bypass();
-
-    Status finish_mem_bypass();
-
     static void pick_sstables_for_merge(const PersistentIndexSstableMetaPB& sstable_meta,
                                         std::vector<PersistentIndexSstablePB>* sstables, bool* merge_base_level);
 
@@ -227,6 +224,19 @@ private:
     std::vector<std::unique_ptr<PersistentIndexSstable>> _sstables;
     // Used to bypass memtable when handle bulk upsert
     std::unique_ptr<MemtableBypassHelper> _mem_bypass_helper;
+};
+
+class MemtableBypassGuard {
+public:
+    explicit MemtableBypassGuard(LakePersistentIndex* index) : _index(index) {}
+
+    ~MemtableBypassGuard() { _index->_mem_bypass_helper.reset(); }
+
+    Status begin();
+    Status finish();
+
+private:
+    LakePersistentIndex* _index;
 };
 
 } // namespace lake

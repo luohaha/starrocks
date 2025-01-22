@@ -173,6 +173,7 @@ public abstract class AlterJobV2 implements Writable {
     }
 
     public boolean isTimeout() {
+        LOG.info("alter job timeout {}", timeoutMs);
         return System.currentTimeMillis() - createTimeMs > timeoutMs;
     }
 
