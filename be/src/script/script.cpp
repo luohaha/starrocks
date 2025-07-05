@@ -310,14 +310,15 @@ public:
         return proto_to_json(pb);
     }
 
-    static int64_t datafile_gc(std::string_view root_location, std::string_view audit_file_path,
-                               int64_t expired_seconds, bool do_delete) {
+    static std::string datafile_gc(const std::string& root_location, const std::string& audit_file_path,
+                                   int64_t expired_seconds, bool do_delete) {
         auto val_st = lake::datafile_gc(root_location, audit_file_path, expired_seconds, do_delete);
         if (!val_st.ok()) {
             LOG(WARNING) << "datafile_gc failed: " << val_st.status().to_string();
-            return -1;
+            // return empty string to indicate failure
+            return "";
         }
-        return val_st.value();
+        return std::to_string(val_st.value());
     }
 
     static std::shared_ptr<TabletBasicInfo> get_tablet_info(int64_t tablet_id) {
