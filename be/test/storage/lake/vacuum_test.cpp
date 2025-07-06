@@ -2692,4 +2692,8 @@ TEST_P(LakeVacuumTest, test_vacuum_shared_data_files) {
     SyncPoint::GetInstance()->DisableProcessing();
 }
 
+TEST_P(LakeVacuumTest, test_garbage_file_check) {
+    // TODO : add more test cases
+}
+
 } // namespace starrocks::lake

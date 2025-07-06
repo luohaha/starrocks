@@ -316,4 +316,9 @@ public class VacuumTest {
         Config.lake_autovacuum_detect_vaccumed_version = false;
         Assertions.assertTrue(autovacuumDaemon.shouldVacuum(partition));
     }
+
+    @Test
+    public void testIgnoreVacuumGraceTimestamp() throws Exception {
+        // TODO add more test cases
+    }
 }

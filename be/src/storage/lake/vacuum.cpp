@@ -1439,4 +1439,8 @@ StatusOr<int64_t> datafile_gc(std::string_view root_location, std::string_view a
     return pair_or.value().first;
 }
 
+StatusOr<int64_t> garbage_file_check(std::string_view root_location) {
+    return datafile_gc(root_location, "", 0, false);
+}
+
 } // namespace starrocks::lake

@@ -310,11 +310,10 @@ public:
         return proto_to_json(pb);
     }
 
-    static std::string datafile_gc(const std::string& root_location, const std::string& audit_file_path,
-                                   int64_t expired_seconds, bool do_delete) {
-        auto val_st = lake::datafile_gc(root_location, audit_file_path, expired_seconds, do_delete);
+    static std::string garbage_file_check(const std::string& root_location) {
+        auto val_st = lake::garbage_file_check(root_location);
         if (!val_st.ok()) {
-            LOG(WARNING) << "datafile_gc failed: " << val_st.status().to_string();
+            LOG(WARNING) << "garbage_file_check failed: " << val_st.status().to_string();
             // return empty string to indicate failure
             return "";
         }
@@ -610,7 +609,7 @@ public:
             REG_STATIC_METHOD(StorageEngineRef, ls_tablet_dir);
             REG_STATIC_METHOD(StorageEngineRef, set_error_state);
             REG_STATIC_METHOD(StorageEngineRef, recover_tablet);
-            REG_STATIC_METHOD(StorageEngineRef, datafile_gc);
+            REG_STATIC_METHOD(StorageEngineRef, garbage_file_check);
         }
     }
 };
