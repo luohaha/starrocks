@@ -319,6 +319,16 @@ public class VacuumTest {
 
     @Test
     public void testIgnoreVacuumGraceTimestamp() throws Exception {
-        // TODO add more test cases
+        partition = olapTable.getPhysicalPartitions().stream().findFirst().orElse(null);
+        AutovacuumDaemon autovacuumDaemon = new AutovacuumDaemon();
+        long current = System.currentTimeMillis();
+        partition.setVisibleVersion(10L, current);
+        partition.setMinRetainVersion(5L);
+        partition.setLastSuccVacuumVersion(10L);
+        partition.setLastVacuumTime(current);
+        Assertions.assertFalse(autovacuumDaemon.shouldVacuum(partition));
+
+        Config.lake_ignore_grace_timestamp_partition_ids = String.valueOf(partition.getId());
+        Assertions.assertTrue(autovacuumDaemon.shouldVacuum(partition));
     }
 }
