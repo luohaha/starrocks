@@ -366,7 +366,7 @@ public:
     RowsetSharedPtr get_rowset(uint32_t rowset_id);
 
     void check_for_apply() {
-        _apply_schedule.store(false);
+        _apply_state.clear_pending();
         _check_for_apply();
     }
 
@@ -506,7 +506,7 @@ private:
     Status _check_conflict_with_partial_update(CompactionInfo* info);
 
     // these functions is only used in ut
-    void stop_apply(bool apply_stopped) { _apply_stopped = apply_stopped; }
+    void stop_apply(bool apply_stopped);
     void stop_compaction(bool running) {
         _compaction_running = running;
         if (running) {
@@ -514,7 +514,7 @@ private:
         }
     }
     void wait_apply_done() { _wait_apply_done(); }
-    bool is_apply_stop() { return _apply_stopped.load(); }
+    bool is_apply_stop() { return _apply_state.stopped(); }
 
     bool compaction_running() { return _compaction_running; }
 
@@ -557,15 +557,53 @@ private:
     std::map<int64_t, int64_t> _gtid_to_version_map;
 
     // used for async apply, make sure at most 1 thread is doing applying
-    mutable std::mutex _apply_running_lock;
-    // make sure at most 1 thread is read or write primary index
     mutable std::shared_timed_mutex _index_lock;
-    // apply process is running currently
-    bool _apply_running = false;
 
-    // used to stop apply thread when shutting-down this tablet
-    std::atomic<bool> _apply_stopped = false;
-    std::condition_variable _apply_stopped_cond;
+    struct ApplyState {
+        enum class State { IDLE, RUNNING, PENDING, STOPPED };
+        std::atomic<State> state{State::IDLE};
+        std::mutex m;
+        std::condition_variable cv;
+
+        bool start() {
+            std::lock_guard<std::mutex> lg(m);
+            if (state == State::STOPPED || state == State::RUNNING) {
+                return false;
+            }
+            state = State::RUNNING;
+            return true;
+        }
+
+        void finish(bool pending = false) {
+            std::lock_guard<std::mutex> lg(m);
+            state = pending ? State::PENDING : State::IDLE;
+            cv.notify_all();
+        }
+
+        void stop_and_wait() {
+            std::unique_lock<std::mutex> ul(m);
+            state = State::STOPPED;
+            while (state == State::RUNNING) {
+                cv.wait(ul);
+            }
+        }
+
+        void resume() {
+            std::lock_guard<std::mutex> lg(m);
+            if (state == State::STOPPED) {
+                state = State::IDLE;
+            }
+        }
+
+        bool stopped() const { return state.load() == State::STOPPED; }
+        bool running() const { return state.load() == State::RUNNING; }
+        bool pending() const { return state.load() == State::PENDING; }
+
+        void clear_pending() {
+            State expected = State::PENDING;
+            state.compare_exchange_strong(expected, State::IDLE);
+        }
+    } _apply_state;
 
     BlockingQueue<RowsetSharedPtr> _unused_rowsets;
 
@@ -596,8 +634,15 @@ private:
 
     std::atomic<double> _pk_index_write_amp_score{0.0};
 
-    std::atomic<bool> _apply_schedule{false};
-    size_t _apply_failed_time = 0;
+size_t _apply_failed_time = 0;
 };
+
+inline void TabletUpdates::stop_apply(bool apply_stopped) {
+    if (apply_stopped) {
+        _apply_state.state.store(ApplyState::State::STOPPED);
+    } else {
+        _apply_state.resume();
+    }
+}
 
 } // namespace starrocks
