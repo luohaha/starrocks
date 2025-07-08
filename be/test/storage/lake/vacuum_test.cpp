@@ -2692,4 +2692,8 @@ TEST_P(LakeVacuumTest, test_vacuum_shared_data_files) {
     SyncPoint::GetInstance()->DisableProcessing();
 }
 
+TEST_P(LakeVacuumTest, test_first_visible_version_in_vacuum) {
+    // TODO : add test case to cover the case that first visible version has been set.
+}
+
 } // namespace starrocks::lake
