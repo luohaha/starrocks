@@ -383,7 +383,7 @@ Status TabletUpdates::_load_from_pb(const TabletUpdatesPB& tablet_updates_pb) {
     _update_total_stats(_edit_version_infos[_apply_version_idx]->rowsets, nullptr, nullptr);
     VLOG(2) << "load tablet " << _debug_string(false, true);
     _try_commit_pendings_unlocked();
-    _check_for_apply();
+    _check_for_apply_locked();
 
     return Status::OK();
 }
@@ -704,7 +704,7 @@ Status TabletUpdates::rowset_commit(int64_t version, const RowsetSharedPtr& rows
                         << " #pending:" << _pending_commits.size();
             }
             _try_commit_pendings_unlocked();
-            _check_for_apply();
+            _check_for_apply_locked();
             if (wait_time_ms > 0) {
                 st = _wait_for_version(EditVersion(version, 0), wait_time_ms, ul);
             }
@@ -938,12 +938,12 @@ private:
     TabletSharedPtr _tablet;
 };
 
-void TabletUpdates::_check_for_apply() {
-    // assuming _lock is already hold
-    if (_apply_state.stopped()) {
+void TabletUpdates::_check_for_apply_locked() {
+    // REQUIRE: _lock is held
+    if (_apply_state.stopped_state()) {
         return;
     }
-    if ((config::enable_retry_apply && _apply_state.pending()) ||
+    if ((config::enable_retry_apply && _apply_state.scheduled_state()) ||
         _apply_version_idx + 1 == _edit_version_infos.size()) {
         return;
     }
@@ -958,6 +958,11 @@ void TabletUpdates::_check_for_apply() {
                 strings::Substitute("submit apply task failed: $0 $1", st.to_string(), _debug_string(false, false));
         LOG(FATAL) << msg;
     }
+}
+
+void TabletUpdates::_check_for_apply() {
+    std::lock_guard<std::mutex> lg(_lock);
+    _check_for_apply_locked();
 }
 
 bool TabletUpdates::need_apply() const {
@@ -996,7 +1001,7 @@ void TabletUpdates::do_apply() {
     // only 1 thread at max is running this method
     bool first = true;
     bool schedule_pending = false;
-    while (!_apply_state.stopped()) {
+    while (!_apply_state.stopped_state()) {
         Status apply_st;
         const EditVersionInfo* version_info_apply = nullptr;
         {
@@ -1066,12 +1071,15 @@ void TabletUpdates::do_apply() {
             }
         }
     }
-    _apply_state.finish(schedule_pending);
+    bool need_schedule = _apply_state.finish(schedule_pending);
+    if (need_schedule) {
+        check_for_apply();
+    }
 }
 
 void TabletUpdates::_wait_apply_done() {
     std::unique_lock<std::mutex> ul(_apply_state.m);
-    while (_apply_state.running()) {
+    while (_apply_state.running_state()) {
         _apply_state.cv.wait(ul);
     }
 }
@@ -1085,7 +1093,7 @@ void TabletUpdates::stop_and_wait_apply_done() {
 }
 
 Status TabletUpdates::breakpoint_check() {
-    if (_apply_state.stopped()) {
+    if (_apply_state.stopped_state()) {
         // apply stopped, return error and stop the apply process
         return Status::Aborted(kBreakpointMsg);
     } else {
@@ -1888,7 +1896,7 @@ Status TabletUpdates::_wait_for_version(const EditVersion& version, int64_t time
     }
     int64_t wait_start = MonotonicMillis();
     while (true) {
-        if (_apply_state.stopped()) {
+        if (_apply_state.stopped_state()) {
             return Status::InternalError(
                     strings::Substitute("wait_for_version version:$0 failed: apply stopped, tablet "
                                         "might have been dropped due to certain reasons and you can retry. $1",
@@ -2280,7 +2288,7 @@ Status TabletUpdates::_commit_compaction(std::unique_ptr<CompactionInfo>* pinfo,
             << " #pending:" << _pending_commits.size()
             << " state_memory:" << PrettyPrinter::print(_compaction_state->memory_usage(), TUnit::BYTES);
     VLOG(2) << "update compaction commit " << _debug_string(false, true);
-    _check_for_apply();
+    _check_for_apply_locked();
     *commit_version = edit_version_info_ptr->version;
     span->SetAttribute("version", commit_version->to_string());
     return Status::OK();

@@ -366,8 +366,9 @@ public:
     RowsetSharedPtr get_rowset(uint32_t rowset_id);
 
     void check_for_apply() {
-        _apply_state.clear_pending();
-        _check_for_apply();
+        std::lock_guard<std::mutex> lg(_lock);
+        _apply_state.clear_scheduled();
+        _check_for_apply_locked();
     }
 
     // just for ut
@@ -418,6 +419,9 @@ private:
 
     // check if needs submit an async apply task
     // assuming _lock is already hold
+    void _check_for_apply_locked();
+
+    // call _check_for_apply_locked with |_lock| held internally
     void _check_for_apply();
 
     void _sync_apply_version_idx(const EditVersion& v);
@@ -514,7 +518,7 @@ private:
         }
     }
     void wait_apply_done() { _wait_apply_done(); }
-    bool is_apply_stop() { return _apply_state.stopped(); }
+    bool is_apply_stop() { return _apply_state.stopped_state(); }
 
     bool compaction_running() { return _compaction_running; }
 
@@ -560,49 +564,53 @@ private:
     mutable std::shared_timed_mutex _index_lock;
 
     struct ApplyState {
-        enum class State { IDLE, RUNNING, PENDING, STOPPED };
-        std::atomic<State> state{State::IDLE};
+        std::atomic<bool> running{false};
+        std::atomic<bool> stopped{false};
+        std::atomic<bool> scheduled{false};
         std::mutex m;
         std::condition_variable cv;
 
         bool start() {
             std::lock_guard<std::mutex> lg(m);
-            if (state == State::STOPPED || state == State::RUNNING) {
+            if (running.load() || stopped.load()) {
+                if (running.load()) {
+                    scheduled.store(true);
+                }
                 return false;
             }
-            state = State::RUNNING;
+            running.store(true);
+            scheduled.store(false);
             return true;
         }
 
-        void finish(bool pending = false) {
+        // return true if there is pending apply need reschedule
+        bool finish(bool pending = false) {
             std::lock_guard<std::mutex> lg(m);
-            state = pending ? State::PENDING : State::IDLE;
+            running.store(false);
+            bool need = scheduled.load() || pending;
+            scheduled.store(false);
             cv.notify_all();
+            return need;
         }
 
         void stop_and_wait() {
             std::unique_lock<std::mutex> ul(m);
-            state = State::STOPPED;
-            while (state == State::RUNNING) {
+            stopped.store(true);
+            while (running.load()) {
                 cv.wait(ul);
             }
         }
 
         void resume() {
             std::lock_guard<std::mutex> lg(m);
-            if (state == State::STOPPED) {
-                state = State::IDLE;
-            }
+            stopped.store(false);
         }
 
-        bool stopped() const { return state.load() == State::STOPPED; }
-        bool running() const { return state.load() == State::RUNNING; }
-        bool pending() const { return state.load() == State::PENDING; }
+        bool stopped_state() const { return stopped.load(); }
+        bool running_state() const { return running.load(); }
+        bool scheduled_state() const { return scheduled.load(); }
 
-        void clear_pending() {
-            State expected = State::PENDING;
-            state.compare_exchange_strong(expected, State::IDLE);
-        }
+        void clear_scheduled() { scheduled.store(false); }
     } _apply_state;
 
     BlockingQueue<RowsetSharedPtr> _unused_rowsets;
@@ -639,7 +647,7 @@ size_t _apply_failed_time = 0;
 
 inline void TabletUpdates::stop_apply(bool apply_stopped) {
     if (apply_stopped) {
-        _apply_state.state.store(ApplyState::State::STOPPED);
+        _apply_state.stopped.store(true);
     } else {
         _apply_state.resume();
     }
