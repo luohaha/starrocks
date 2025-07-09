@@ -383,7 +383,7 @@ Status TabletUpdates::_load_from_pb(const TabletUpdatesPB& tablet_updates_pb) {
     _update_total_stats(_edit_version_infos[_apply_version_idx]->rowsets, nullptr, nullptr);
     VLOG(2) << "load tablet " << _debug_string(false, true);
     _try_commit_pendings_unlocked();
-    _check_for_apply();
+    _check_for_apply_locked();
 
     return Status::OK();
 }
@@ -704,7 +704,7 @@ Status TabletUpdates::rowset_commit(int64_t version, const RowsetSharedPtr& rows
                         << " #pending:" << _pending_commits.size();
             }
             _try_commit_pendings_unlocked();
-            _check_for_apply();
+            _check_for_apply_locked();
             if (wait_time_ms > 0) {
                 st = _wait_for_version(EditVersion(version, 0), wait_time_ms, ul);
             }
@@ -938,19 +938,18 @@ private:
     TabletSharedPtr _tablet;
 };
 
-void TabletUpdates::_check_for_apply() {
-    // assuming _lock is already hold
-    if (_apply_stopped) {
+void TabletUpdates::_check_for_apply_locked() {
+    // REQUIRE: _lock is held
+    if (_apply_state.stopped_state()) {
         return;
     }
-    _apply_running_lock.lock();
-    if ((config::enable_retry_apply && _apply_schedule.load()) || _apply_running ||
+    if ((config::enable_retry_apply && _apply_state.scheduled_state()) ||
         _apply_version_idx + 1 == _edit_version_infos.size()) {
-        _apply_running_lock.unlock();
         return;
     }
-    _apply_running = true;
-    _apply_running_lock.unlock();
+    if (!_apply_state.start()) {
+        return;
+    }
     std::shared_ptr<Runnable> task(
             std::make_shared<ApplyCommitTask>(std::static_pointer_cast<Tablet>(_tablet.shared_from_this())));
     auto st = StorageEngine::instance()->update_manager()->apply_thread_pool()->submit(std::move(task));
@@ -959,6 +958,11 @@ void TabletUpdates::_check_for_apply() {
                 strings::Substitute("submit apply task failed: $0 $1", st.to_string(), _debug_string(false, false));
         LOG(FATAL) << msg;
     }
+}
+
+void TabletUpdates::_check_for_apply() {
+    std::lock_guard<std::mutex> lg(_lock);
+    _check_for_apply_locked();
 }
 
 bool TabletUpdates::need_apply() const {
@@ -996,7 +1000,8 @@ void TabletUpdates::do_apply() {
             config::enable_pk_strict_memcheck ? StorageEngine::instance()->update_manager()->mem_tracker() : nullptr);
     // only 1 thread at max is running this method
     bool first = true;
-    while (!_apply_stopped) {
+    bool schedule_pending = false;
+    while (!_apply_state.stopped_state()) {
         Status apply_st;
         const EditVersionInfo* version_info_apply = nullptr;
         {
@@ -1044,7 +1049,7 @@ void TabletUpdates::do_apply() {
             std::string msg = strings::Substitute("apply tablet: $0 failed and retry later, status: $1",
                                                   _tablet.tablet_id(), apply_st.to_string());
             LOG(WARNING) << msg;
-            _apply_schedule.store(true);
+            schedule_pending = true;
             break;
         } else if (_is_breakpoint(apply_st)) {
             // apply stopped, clean states and quit.
@@ -1066,30 +1071,29 @@ void TabletUpdates::do_apply() {
             }
         }
     }
-    std::lock_guard<std::mutex> lg(_apply_running_lock);
-    DCHECK(_apply_running) << "illegal state: _apply_running should be true";
-    _apply_running = false;
-    _apply_stopped_cond.notify_all();
+    bool need_schedule = _apply_state.finish(schedule_pending);
+    if (need_schedule) {
+        check_for_apply();
+    }
 }
 
 void TabletUpdates::_wait_apply_done() {
-    std::unique_lock<std::mutex> ul(_apply_running_lock);
-    while (_apply_running) {
-        _apply_stopped_cond.wait(ul);
+    std::unique_lock<std::mutex> ul(_apply_state.m);
+    while (_apply_state.running_state()) {
+        _apply_state.cv.wait(ul);
     }
 }
 
 void TabletUpdates::stop_and_wait_apply_done() {
     int64_t start_time = MonotonicMicros();
-    _apply_stopped = true;
-    _wait_apply_done();
+    _apply_state.stop_and_wait();
     int64_t duration = MonotonicMicros() - start_time;
     StarRocksMetrics::instance()->primary_key_wait_apply_done_duration_ms.increment(duration / 1000);
     StarRocksMetrics::instance()->primary_key_wait_apply_done_total.increment(1);
 }
 
 Status TabletUpdates::breakpoint_check() {
-    if (_apply_stopped) {
+    if (_apply_state.stopped_state()) {
         // apply stopped, return error and stop the apply process
         return Status::Aborted(kBreakpointMsg);
     } else {
@@ -1892,7 +1896,7 @@ Status TabletUpdates::_wait_for_version(const EditVersion& version, int64_t time
     }
     int64_t wait_start = MonotonicMillis();
     while (true) {
-        if (_apply_stopped) {
+        if (_apply_state.stopped_state()) {
             return Status::InternalError(
                     strings::Substitute("wait_for_version version:$0 failed: apply stopped, tablet "
                                         "might have been dropped due to certain reasons and you can retry. $1",
@@ -2284,7 +2288,7 @@ Status TabletUpdates::_commit_compaction(std::unique_ptr<CompactionInfo>* pinfo,
             << " #pending:" << _pending_commits.size()
             << " state_memory:" << PrettyPrinter::print(_compaction_state->memory_usage(), TUnit::BYTES);
     VLOG(2) << "update compaction commit " << _debug_string(false, true);
-    _check_for_apply();
+    _check_for_apply_locked();
     *commit_version = edit_version_info_ptr->version;
     span->SetAttribute("version", commit_version->to_string());
     return Status::OK();
@@ -4968,7 +4972,7 @@ Status TabletUpdates::load_snapshot(const SnapshotMeta& snapshot_meta, bool rest
         DeferOp defer([&]() {
             if (!_error.load()) {
                 // Start apply thread again.
-                _apply_stopped.store(false);
+                _apply_state.resume();
                 _check_for_apply();
             }
         });
@@ -5708,7 +5712,7 @@ Status TabletUpdates::recover() {
     DeferOp defer([&]() {
         if (!_error.load()) {
             // Start apply thread again.
-            _apply_stopped.store(false);
+            _apply_state.resume();
             _check_for_apply();
         }
     });
