@@ -110,8 +110,10 @@ Status HorizontalGeneralTabletWriter::reset_segment_writer(bool eos) {
         // then we will create a shared file for this segment writer.
         RETURN_IF_ERROR(_bundle_file_context->try_create_bundle_file(create_file_fn));
         of = std::make_unique<BundleWritableFile>(_bundle_file_context, wopts.encryption_info);
+        StarRocksMetrics::instance()->create_bundle_segment_file.increment(1);
     } else {
         ASSIGN_OR_RETURN(of, create_file_fn());
+        StarRocksMetrics::instance()->create_normal_segment_file.increment(1);
     }
     auto w = std::make_unique<SegmentWriter>(std::move(of), _seg_id++, _schema, opts);
     RETURN_IF_ERROR(w->init());

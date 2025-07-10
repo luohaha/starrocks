@@ -91,6 +91,8 @@ StarRocksMetrics::StarRocksMetrics() : _metrics(_s_registry_name), _table_metric
     REGISTER_STARROCKS_METRIC(segment_flush_duration_us);
     REGISTER_STARROCKS_METRIC(segment_flush_io_time_us);
     REGISTER_STARROCKS_METRIC(segment_flush_bytes_total);
+    REGISTER_STARROCKS_METRIC(create_bundle_segment_file);
+    REGISTER_STARROCKS_METRIC(create_normal_segment_file);
 
     REGISTER_STARROCKS_METRIC(update_rowset_commit_request_total);
     REGISTER_STARROCKS_METRIC(update_rowset_commit_request_failed);
