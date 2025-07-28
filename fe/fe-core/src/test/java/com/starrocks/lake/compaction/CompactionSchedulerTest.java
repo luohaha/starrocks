@@ -176,7 +176,7 @@ public class CompactionSchedulerTest {
             }
         };
 
-        new MockUp<CompactionScheduler>(compactionScheduler) {
+        new MockUp<CompactionScheduler>() {
             @Mock
             protected long beginTransaction(PartitionIdentifier partition, ComputeResource computeResource) {
                 return 100L;
