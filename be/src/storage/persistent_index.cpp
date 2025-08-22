@@ -4719,7 +4719,7 @@ Status PersistentIndex::_minor_compaction(PersistentIndexMetaPB* index_meta) {
         // step 1.a
         // move tmp l1 to l1
         std::string tmp_l1_filename = _l1_vec[_has_l1 ? 1 : 0]->filename();
-        // Make new file doesn't exist
+        // Make sure new file doesn't exist
         (void)FileSystem::Default()->delete_file(new_l1_filename);
         RETURN_IF_ERROR(FileSystem::Default()->link_file(tmp_l1_filename, new_l1_filename));
         if (_l0->size() > 0) {
@@ -4730,18 +4730,23 @@ Status PersistentIndex::_minor_compaction(PersistentIndexMetaPB* index_meta) {
                 << " to l1: " << new_l1_filename << " snapshot: " << need_snapshot;
     } else if (tmp_l1_cnt > 1) {
         // step 1.b
+        // link latest tmp l1 to new l1 file
+        (void)FileSystem::Default()->delete_file(new_l1_filename);
+        RETURN_IF_ERROR(FileSystem::Default()->link_file(_l1_vec.back()->filename(), new_l1_filename));
+        const std::string new_l2_file_path =
+                strings::Substitute("$0/index.l2.$1.$2", _path, _l1_version.major_number(), _l1_version.minor_number());
         auto writer = std::make_unique<ImmutableIndexWriter>();
-        RETURN_IF_ERROR(writer->init(new_l1_filename, _version, true));
-        // followe this rules:
-        // 1, remove delete key when l2 not exist
-        // 2. skip merge l1, only merge tmp-l1 and l0
-        RETURN_IF_ERROR(_reload_usage_and_size_by_key_length(_has_l1 ? 1 : 0, _l1_vec.size(), false));
-        // keep delete flag when l2 or older l1 exist
-        RETURN_IF_ERROR(_merge_compaction_internal(writer.get(), _has_l1 ? 1 : 0, _l1_vec.size(),
-                                                   _usage_and_size_by_key_length, !_l2_vec.empty() || _has_l1));
+        RETURN_IF_ERROR(writer->init(new_l2_file_path, _version, true));
+        // Merge old l1 with tmp l1 files. (except latest tmp l1)
+        RETURN_IF_ERROR(_reload_usage_and_size_by_key_length(0, _l1_vec.size() - 1, false));
+        // keep delete flag when l2 exist
+        RETURN_IF_ERROR(_merge_compaction_internal(writer.get(), 0, _l1_vec.size() - 1, _usage_and_size_by_key_length,
+                                                   !_l2_vec.empty()));
         RETURN_IF_ERROR(writer->finish());
         VLOG(2) << "PersistentIndex minor compaction, merge tmp l1, merge cnt: " << _l1_vec.size()
-                << ", output: " << new_l1_filename;
+                << ", output: " << new_l2_file_path;
+        _l1_version.to_pb(index_meta->add_l2_versions());
+        index_meta->add_l2_version_merged(false);
     } else if (_l1_vec.size() == 1) {
         // step 1.c
         RETURN_IF_ERROR(_flush_l0());
@@ -4756,14 +4761,14 @@ Status PersistentIndex::_minor_compaction(PersistentIndexMetaPB* index_meta) {
                 << "output: " << new_l1_filename;
     }
     // 2. move old l1 to l2.
-    if (_has_l1) {
+    if (_has_l1 && tmp_l1_cnt <= 1) {
         // just link old l1 file to l2
         const std::string l2_file_path =
                 strings::Substitute("$0/index.l2.$1.$2", _path, _l1_version.major_number(), _l1_version.minor_number());
         const std::string old_l1_file_path =
                 strings::Substitute("$0/index.l1.$1.$2", _path, _l1_version.major_number(), _l1_version.minor_number());
         VLOG(2) << "PersistentIndex minor compaction, link from " << old_l1_file_path << " to " << l2_file_path;
-        // Make new file doesn't exist
+        // Make sure new file doesn't exist
         (void)FileSystem::Default()->delete_file(l2_file_path);
         RETURN_IF_ERROR(FileSystem::Default()->link_file(old_l1_file_path, l2_file_path));
         _l1_version.to_pb(index_meta->add_l2_versions());

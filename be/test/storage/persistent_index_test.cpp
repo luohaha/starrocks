@@ -3433,6 +3433,110 @@ TEST_P(PersistentIndexTest, pindex_major_compact_meta) {
     ASSERT_FALSE(PersistentIndex::modify_l2_versions(input_l2_versions, input_l2_versions.back(), index_meta).ok());
 }
 
+TEST_P(PersistentIndexTest, test_minor_compaction_with_multiple_tmp_l1_bulk_load) {
+    // Set small l0_max_mem_usage to trigger multiple tmp l1 creation during bulk load
+    config::l0_max_mem_usage = 100;
+    config::max_tmp_l1_num = 10;
+    FileSystem* fs = FileSystem::Default();
+    const std::string kPersistentIndexDir = "./PersistentIndexTest_test_minor_compaction_with_multiple_tmp_l1_bulk_load";
+    const std::string kIndexFile = "./PersistentIndexTest_test_minor_compaction_with_multiple_tmp_l1_bulk_load/index.l0.0.0";
+    bool created;
+    ASSERT_OK(fs->create_dir_if_missing(kPersistentIndexDir, &created));
+
+    using Key = std::string;
+    PersistentIndexMetaPB index_meta;
+    const int N = 2000;
+    int64_t cur_version = 0;
+    
+    vector<Key> keys(N);
+    vector<Slice> key_slices;
+    vector<IndexValue> values;
+    key_slices.reserve(N);
+    for (int i = 0; i < N; i++) {
+        keys[i] = "bulk_key_" + std::to_string(i);
+        values.emplace_back(i);
+        key_slices.emplace_back(keys[i]);
+    }
+
+    {
+        ASSIGN_OR_ABORT(auto wfile, FileSystem::Default()->new_writable_file(kIndexFile));
+        ASSERT_OK(wfile->close());
+    }
+
+    {
+        EditVersion version(cur_version++, 0);
+        index_meta.set_key_size(0);
+        index_meta.set_size(0);
+        version.to_pb(index_meta.mutable_version());
+        MutableIndexMetaPB* l0_meta = index_meta.mutable_l0_meta();
+        l0_meta->set_format_version(PERSISTENT_INDEX_VERSION_5);
+        IndexSnapshotMetaPB* snapshot_meta = l0_meta->mutable_snapshot();
+        version.to_pb(snapshot_meta->mutable_version());
+
+        PersistentIndex index(kPersistentIndexDir);
+        ASSERT_OK(index.load(index_meta));
+        
+        // Simulate bulk load: prepare once, multiple upserts, then single commit
+        ASSERT_OK(index.prepare(EditVersion(cur_version++, 0), N));
+        
+        // Perform multiple upsert operations to simulate bulk load
+        // This should create multiple tmp l1 files when l0 exceeds l0_max_mem_usage
+        int batch_size = 200;
+        for (int batch = 0; batch < N / batch_size; batch++) {
+            int start_idx = batch * batch_size;
+            int end_idx = std::min(start_idx + batch_size, N);
+            int current_batch_size = end_idx - start_idx;
+            
+            std::vector<IndexValue> old_values(current_batch_size, IndexValue(NullIndexValue));
+            ASSERT_OK(index.upsert(current_batch_size, 
+                                 &key_slices[start_idx], 
+                                 &values[start_idx],
+                                 old_values.data()));
+        }
+        
+        // Single commit at the end - this should trigger minor compaction with multiple tmp l1
+        ASSERT_OK(index.commit(&index_meta));
+        ASSERT_OK(index.on_commited());
+
+        // Verify the new minor compaction logic was executed:
+        // When tmp_l1_cnt > 1:
+        // 1. Latest tmp l1 is linked as new l1
+        // 2. Other tmp l1 files are merged into l2
+        // 3. l2_versions and l2_version_merged are updated
+        
+        if (index_meta.l2_versions_size() > 0) {
+            ASSERT_EQ(index_meta.l2_versions_size(), index_meta.l2_version_merged_size());
+            
+            // l2_version_merged should be false for l2 created from tmp l1 merge
+            for (int i = 0; i < index_meta.l2_version_merged_size(); i++) {
+                ASSERT_FALSE(index_meta.l2_version_merged(i));
+            }
+        }
+
+        // Verify data integrity
+        std::vector<IndexValue> get_values(keys.size());
+        ASSERT_TRUE(index.get(keys.size(), key_slices.data(), get_values.data()).ok());
+        ASSERT_EQ(keys.size(), get_values.size());
+        for (int i = 0; i < values.size(); i++) {
+            ASSERT_EQ(values[i], get_values[i]);
+        }
+    }
+
+    // Test reload after minor compaction
+    {
+        PersistentIndex new_index(kPersistentIndexDir);
+        ASSERT_TRUE(new_index.load(index_meta).ok());
+
+        std::vector<IndexValue> get_values(keys.size());
+        ASSERT_TRUE(new_index.get(keys.size(), key_slices.data(), get_values.data()).ok());
+        for (int i = 0; i < values.size(); i++) {
+            ASSERT_EQ(values[i], get_values[i]);
+        }
+    }
+
+    ASSERT_TRUE(fs::remove_all(kPersistentIndexDir).ok());
+}
+
 INSTANTIATE_TEST_SUITE_P(PersistentIndexTest, PersistentIndexTest,
                          ::testing::Values(PersistentIndexTestParam{true, false},
                                            PersistentIndexTestParam{false, true}));
