@@ -22,9 +22,11 @@
 #include "runtime/exec_env.h"
 #include "serde/column_array_serde.h"
 #include "storage/lake/filenames.h"
+#include "storage/lake/persistent_index_sstable.h"
 #include "storage/lake/tablet_manager.h"
 #include "storage/rows_mapper.h"
 #include "storage/rowset/segment_writer.h"
+#include "storage/sstable/table_builder.h"
 #include "util/runtime_profile.h"
 
 namespace starrocks::lake {
@@ -110,6 +112,12 @@ Status HorizontalPkTabletWriter::flush_segment_writer(SegmentPB* segment) {
             segment->set_encryption_meta(_seg_writer->encryption_meta());
         }
         _seg_writer.reset();
+    }
+    if (_pk_sst_builder != nullptr) {
+        RETURN_IF_ERROR(_pk_sst_builder->finish());
+        auto sst_file_info = _pk_sst_builder->file_info();
+        _ssts.emplace_back(sst_file_info);
+        _pk_sst_builder.reset();
     }
     return Status::OK();
 }

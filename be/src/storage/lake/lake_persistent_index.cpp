@@ -156,7 +156,9 @@ LakePersistentIndex::LakePersistentIndex(TabletManager* tablet_mgr, int64_t tabl
         : PersistentIndex(""), _tablet_mgr(tablet_mgr), _tablet_id(tablet_id) {}
 
 LakePersistentIndex::~LakePersistentIndex() {
-    _memtable->clear();
+    if (_memtable != nullptr) {
+        _memtable->clear();
+    }
     _sstables.clear();
 }
 
@@ -243,6 +245,30 @@ Status LakePersistentIndex::minor_compact() {
     RETURN_IF_ERROR(sstable->init(std::move(rf), sstable_pb, block_cache->cache()));
     _sstables.emplace_back(std::move(sstable));
     TRACE_COUNTER_INCREMENT("minor_compact_times", 1);
+    return Status::OK();
+}
+
+Status LakePersistentIndex::add_sst(const FileMetaPB& sst_meta, const std::string& encryption_meta) {
+    auto sstable = std::make_unique<PersistentIndexSstable>();
+    RandomAccessFileOptions opts;
+    if (!encryption_meta.empty()) {
+        ASSIGN_OR_RETURN(opts.encryption_info, KeyCache::instance().unwrap_encryption_meta(encryption_meta));
+    }
+    auto location = _tablet_mgr->sst_location(_tablet_id, sst_meta.name());
+    ASSIGN_OR_RETURN(auto rf, fs::new_random_access_file(opts, location));
+    LOG(INFO) << "add sst " << sst_meta.name() << " to persistent index for tablet " << _tablet_id << " size "
+              << rf->get_size().value() << " " << sst_meta.size();
+    PersistentIndexSstablePB sstable_pb;
+    sstable_pb.set_filename(sst_meta.name());
+    sstable_pb.set_filesize(sst_meta.size());
+    sstable_pb.set_encryption_meta(encryption_meta);
+    auto* block_cache = _tablet_mgr->update_mgr()->block_cache();
+    if (block_cache == nullptr) {
+        return Status::InternalError("Block cache is null.");
+    }
+    TEST_SYNC_POINT_CALLBACK("LakePersistentIndex::minor_compact:inject_predicate", &sstable_pb);
+    RETURN_IF_ERROR(sstable->init(std::move(rf), sstable_pb, block_cache->cache()));
+    _sstables.emplace_back(std::move(sstable));
     return Status::OK();
 }
 

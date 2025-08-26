@@ -202,6 +202,8 @@ message TxnLogPB {
         // for partial update, record dest rewrite segment names to avoid gc
         repeated string rewrite_segments = 4;
         repeated bytes del_encryption_metas = 5;
+        repeated FileMetaPB ssts = 6;
+        repeated bytes sst_encryption_metas = 7;
     }
 
     message OpCompaction {

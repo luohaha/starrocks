@@ -32,6 +32,8 @@ class BundleWritableFileContext;
 
 namespace starrocks::lake {
 
+class PersistentIndexSstableStreamBuilder;
+
 class HorizontalGeneralTabletWriter : public TabletWriter {
 public:
     explicit HorizontalGeneralTabletWriter(TabletManager* tablet_mgr, int64_t tablet_id,
@@ -84,6 +86,11 @@ protected:
     std::unique_ptr<SegmentWriter> _seg_writer;
     BundleWritableFileContext* _bundle_file_context = nullptr;
     GlobalDictByNameMaps* _global_dicts = nullptr;
+    std::unique_ptr<PersistentIndexSstableStreamBuilder> _pk_sst_builder;
+    MutableColumnPtr pk_column;
+    Schema _pkey_schema;
+    size_t _key_size = 0;
+    uint32_t _sst_rowid = 0;
 };
 
 class VerticalGeneralTabletWriter : public TabletWriter {

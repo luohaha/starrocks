@@ -262,7 +262,8 @@ Status UpdateManager::publish_primary_key_tablet(const TxnLogPB_OpWrite& op_writ
         TRACE_COUNTER_SCOPE_LATENCY_US("update_index_latency_us");
         DCHECK(state.upserts(segment_id) != nullptr);
         if (condition_column < 0) {
-            RETURN_IF_ERROR(_do_update(rowset_id, segment_id, state.upserts(segment_id), index, &new_deletes));
+            RETURN_IF_ERROR(_do_update(rowset_id, segment_id, state.upserts(segment_id), index, &new_deletes,
+                                       op_write.ssts_size() > 0));
         } else {
             RETURN_IF_ERROR(_do_update_with_condition(params, rowset_id, segment_id, condition_column,
                                                       state.upserts(segment_id)->pk_column, index, &new_deletes));
@@ -275,6 +276,13 @@ Status UpdateManager::publish_primary_key_tablet(const TxnLogPB_OpWrite& op_writ
         _index_cache.update_object_size(index_entry, index.memory_usage());
         state.release_segment(segment_id);
         _update_state_cache.update_object_size(state_entry, state.memory_usage());
+        if (op_write.ssts_size() > 0) {
+            if (op_write.sst_encryption_metas_size() != op_write.ssts_size()) {
+                RETURN_IF_ERROR(index.add_sst(op_write.ssts(segment_id), ""));
+            } else {
+                RETURN_IF_ERROR(index.add_sst(op_write.ssts(segment_id), op_write.sst_encryption_metas(segment_id)));
+            }
+        }
     }
 
     // 3. Handle del files one by one.
@@ -384,11 +392,17 @@ Status UpdateManager::publish_column_mode_partial_update(const TxnLogPB_OpWrite&
 }
 
 Status UpdateManager::_do_update(uint32_t rowset_id, int32_t upsert_idx, const SegmentPKEncodeResultPtr& upsert,
-                                 PrimaryIndex& index, DeletesMap* new_deletes) {
+                                 PrimaryIndex& index, DeletesMap* new_deletes, bool skip_pk_write) {
     TRACE_COUNTER_SCOPE_LATENCY_US("do_update_latency_us");
     for (; !upsert->done(); upsert->next()) {
         auto current = upsert->current();
-        RETURN_IF_ERROR(index.upsert(rowset_id + upsert_idx, current.second, *current.first, new_deletes));
+        if (skip_pk_write) {
+            // use get instead of upsert
+            std::vector<uint64_t> rowids(current.first->size());
+            RETURN_IF_ERROR(index.get(*current.first, &rowids));
+        } else {
+            RETURN_IF_ERROR(index.upsert(rowset_id + upsert_idx, current.second, *current.first, new_deletes));
+        }
     }
     return upsert->status();
 }

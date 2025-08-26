@@ -23,10 +23,15 @@
 #include "fs/key_cache.h"
 #include "runtime/current_thread.h"
 #include "serde/column_array_serde.h"
+#include "storage/chunk_helper.h"
 #include "storage/lake/filenames.h"
+#include "storage/lake/persistent_index_sstable.h"
 #include "storage/lake/tablet_manager.h"
 #include "storage/lake/vacuum.h"
+#include "storage/primary_index.h"
+#include "storage/primary_key_encoder.h"
 #include "storage/rowset/segment_writer.h"
+#include "storage/sstable/table_builder.h"
 #include "util/threadpool.h"
 
 namespace starrocks::lake {
@@ -78,6 +83,25 @@ Status HorizontalGeneralTabletWriter::write(const starrocks::Chunk& data, Segmen
         RETURN_IF_ERROR(reset_segment_writer(eos));
     }
     RETURN_IF_ERROR(_seg_writer->append_chunk(data));
+    if (_pk_sst_builder != nullptr) {
+        if (pk_column == nullptr) {
+            vector<uint32_t> pk_columns;
+            for (size_t i = 0; i < tablet_schema()->num_key_columns(); i++) {
+                pk_columns.push_back((uint32_t)i);
+            }
+            _pkey_schema = ChunkHelper::convert_schema(tablet_schema(), pk_columns);
+            RETURN_IF_ERROR(PrimaryKeyEncoder::create_column(_pkey_schema, &pk_column));
+            _key_size = PrimaryKeyEncoder::get_encoded_fixed_size(_pkey_schema);
+        }
+        auto clone_pk_column = pk_column->clone_empty();
+        TRY_CATCH_BAD_ALLOC(PrimaryKeyEncoder::encode(_pkey_schema, data, 0, data.num_rows(), clone_pk_column.get()));
+        std::vector<Slice> keys;
+        const Slice* vkeys =
+                PrimaryIndex::build_persistent_keys(*clone_pk_column, _key_size, 0, clone_pk_column->size(), &keys);
+        for (size_t i = 0; i < clone_pk_column->size(); i++) {
+            RETURN_IF_ERROR(_pk_sst_builder->add(vkeys[i], IndexValue(_sst_rowid++), 0));
+        }
+    }
     _num_rows += data.num_rows();
     return Status::OK();
 }
@@ -149,6 +173,23 @@ Status HorizontalGeneralTabletWriter::reset_segment_writer(bool eos) {
     auto w = std::make_unique<SegmentWriter>(std::move(of), _seg_id++, _schema, opts);
     RETURN_IF_ERROR(w->init());
     _seg_writer = std::move(w);
+    // if is pk table
+    if (tablet_schema()->keys_type() == KeysType::PRIMARY_KEYS && can_skip_pk_write()) {
+        LOG(INFO) << "skip persistent index for tablet " << _tablet_id;
+        std::unique_ptr<WritableFile> sst_wf;
+        if (_location_provider && _fs) {
+            ASSIGN_OR_RETURN(sst_wf, _fs->new_writable_file(
+                                             wopts, _location_provider->sst_location(_tablet_id, gen_sst_filename())));
+        } else {
+            ASSIGN_OR_RETURN(sst_wf,
+                             fs::new_writable_file(wopts, _tablet_mgr->sst_location(_tablet_id, gen_sst_filename())));
+        }
+        _pk_sst_builder =
+                std::make_unique<PersistentIndexSstableStreamBuilder>(std::move(sst_wf), opts.encryption_meta);
+        _sst_rowid = 0;
+    } else {
+        LOG(INFO) << "do not create persistent index for tablet " << _tablet_id;
+    }
     return Status::OK();
 }
 

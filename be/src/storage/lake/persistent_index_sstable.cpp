@@ -17,6 +17,7 @@
 #include <butil/time.h> // NOLINT
 
 #include "fs/fs.h"
+#include "gen_cpp/types.pb.h"
 #include "storage/lake/utils.h"
 #include "storage/sstable/table_builder.h"
 #include "util/trace.h"
@@ -108,6 +109,101 @@ Status PersistentIndexSstable::multi_get(const Slice* keys, const KeyIndexSet& k
 
 size_t PersistentIndexSstable::memory_usage() const {
     return (_sst != nullptr) ? _sst->memory_usage() : 0;
+}
+
+PersistentIndexSstableStreamBuilder::PersistentIndexSstableStreamBuilder(std::unique_ptr<WritableFile> wf,
+                                                                         const std::string& encryption_meta)
+        : _wf(std::move(wf)), _finished(false), _encryption_meta(encryption_meta) {
+    _filter_policy.reset(const_cast<sstable::FilterPolicy*>(sstable::NewBloomFilterPolicy(10)));
+    sstable::Options options;
+    options.filter_policy = _filter_policy.get();
+    _table_builder = std::make_unique<sstable::TableBuilder>(options, _wf.get());
+}
+
+Status PersistentIndexSstableStreamBuilder::add(const Slice& key, const IndexValue& value, int64_t version) {
+    if (_finished) {
+        return Status::InvalidArgument("Builder already finished");
+    }
+
+    if (!_status.ok()) {
+        return _status;
+    }
+
+    IndexValuesWithVerPB index_value_pb;
+    auto* val = index_value_pb.add_values();
+    val->set_version(version);
+    val->set_rssid(value.get_rssid());
+    val->set_rowid(value.get_rowid());
+
+    _table_builder->Add(key, Slice(index_value_pb.SerializeAsString()));
+    _status = _table_builder->status();
+    return _status;
+}
+
+Status PersistentIndexSstableStreamBuilder::add(const Slice& key, const IndexValueWithVer& value_with_ver) {
+    return add(key, value_with_ver.second, value_with_ver.first);
+}
+
+Status PersistentIndexSstableStreamBuilder::add_multiple_versions(const Slice& key,
+                                                                  const std::vector<IndexValueWithVer>& values) {
+    if (_finished) {
+        return Status::InvalidArgument("Builder already finished");
+    }
+
+    if (!_status.ok()) {
+        return _status;
+    }
+
+    if (values.empty()) {
+        return Status::InvalidArgument("Values cannot be empty");
+    }
+
+    IndexValuesWithVerPB index_value_pb;
+    for (const auto& value_with_ver : values) {
+        auto* val = index_value_pb.add_values();
+        val->set_version(value_with_ver.first);
+        val->set_rssid(value_with_ver.second.get_rssid());
+        val->set_rowid(value_with_ver.second.get_rowid());
+    }
+
+    _table_builder->Add(key, Slice(index_value_pb.SerializeAsString()));
+    _status = _table_builder->status();
+    return _status;
+}
+
+Status PersistentIndexSstableStreamBuilder::finish(uint64_t* file_size) {
+    if (_finished) {
+        return Status::InvalidArgument("Builder already finished");
+    }
+
+    if (!_status.ok()) {
+        return _status;
+    }
+
+    _status = _table_builder->Finish();
+    if (_status.ok()) {
+        _finished = true;
+        if (file_size != nullptr) {
+            *file_size = _table_builder->FileSize();
+        }
+    }
+    return _status;
+}
+
+uint64_t PersistentIndexSstableStreamBuilder::num_entries() const {
+    return _table_builder ? _table_builder->NumEntries() : 0;
+}
+
+FileInfo PersistentIndexSstableStreamBuilder::file_info() const {
+    FileInfo file_info;
+    file_info.path = file_name(_wf->filename());
+    file_info.size = _table_builder ? _wf->size() : 0;
+    file_info.encryption_meta = _encryption_meta;
+    return file_info;
+}
+
+Status PersistentIndexSstableStreamBuilder::status() const {
+    return _status;
 }
 
 } // namespace starrocks::lake

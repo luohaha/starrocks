@@ -68,6 +68,8 @@ public:
 
     Status commit(const TabletMetadataPtr& metadata, MetaFileBuilder* builder);
 
+    Status add_sst(const FileMetaPB& sst_meta, const std::string& encryption_meta);
+
     double get_local_pk_index_write_amp_score();
 
     void set_local_pk_index_write_amp_score(double score);

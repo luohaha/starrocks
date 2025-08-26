@@ -65,6 +65,8 @@ public:
     // PREREQUISITES: the writer has successfully `finish()`ed but not yet `close()`ed.
     std::vector<FileInfo> files() const { return _files; }
 
+    std::vector<FileInfo> ssts() const { return _ssts; }
+
     // The sum of all segment file sizes, in bytes.
     int64_t data_size() const { return _data_size; }
 
@@ -143,6 +145,22 @@ public:
 
     const DictColumnsValidMap& global_dict_columns_valid_info() const { return _global_dict_columns_valid_info; }
 
+    bool can_skip_pk_write() {
+        if (!config::enable_bypass_pk_memtable) {
+            return false;
+        }
+        // if only one key column, or all key columns are varchar type, we can skip pk write
+        if (tablet_schema()->num_key_columns() == 1) {
+            return true;
+        }
+        for (int i = 0; i < tablet_schema()->num_key_columns(); i++) {
+            if (tablet_schema()->column(i).type() != LogicalType::TYPE_VARCHAR) {
+                return false;
+            }
+        }
+        return true;
+    }
+
 protected:
     TabletManager* _tablet_mgr;
     int64_t _tablet_id;
@@ -150,6 +168,7 @@ protected:
     int64_t _txn_id;
     ThreadPool* _flush_pool;
     std::vector<FileInfo> _files;
+    std::vector<FileInfo> _ssts;
     int64_t _num_rows = 0;
     int64_t _data_size = 0;
     uint32_t _seg_id = 0;
