@@ -21,7 +21,9 @@
 
 #include "gutil/macros.h"
 #include "runtime/global_dict/types_fwd_decl.h"
+#include "storage/lake/persistent_index_sstable.h"
 #include "storage/lake/tablet_writer.h"
+#include "storage/sstable/table_builder.h"
 
 namespace starrocks {
 class ConcurrencyLimitedThreadPoolToken;
@@ -33,6 +35,26 @@ class BundleWritableFileContext;
 namespace starrocks::lake {
 
 class PersistentIndexSstableStreamBuilder;
+
+class PkTabletSSTWriter {
+public:
+    PkTabletSSTWriter(const TabletSchemaCSPtr& tablet_schema_ptr, TabletManager* tablet_mgr, int64_t tablet_id)
+            : _tablet_schema_ptr(tablet_schema_ptr), _tablet_mgr(tablet_mgr), _tablet_id(tablet_id) {}
+    virtual ~PkTabletSSTWriter() = default;
+    Status append_sst_record(const Chunk& data);
+    Status reset_sst_writer(const std::shared_ptr<LocationProvider>& location_provider,
+                            const std::shared_ptr<FileSystem>& fs);
+    StatusOr<FileInfo> flush_sst_writer();
+
+private:
+    std::unique_ptr<PersistentIndexSstableStreamBuilder> _pk_sst_builder;
+    MutableColumnPtr _pk_column;
+    Schema _pkey_schema;
+    size_t _key_size = 0;
+    TabletSchemaCSPtr _tablet_schema_ptr;
+    TabletManager* _tablet_mgr;
+    int64_t _tablet_id;
+};
 
 class HorizontalGeneralTabletWriter : public TabletWriter {
 public:
@@ -80,17 +102,12 @@ public:
     RowsetTxnMetaPB* rowset_txn_meta() override { return nullptr; }
 
 protected:
-    Status reset_segment_writer(bool eos);
+    virtual Status reset_segment_writer(bool eos);
     virtual Status flush_segment_writer(SegmentPB* segment = nullptr);
 
     std::unique_ptr<SegmentWriter> _seg_writer;
     BundleWritableFileContext* _bundle_file_context = nullptr;
     GlobalDictByNameMaps* _global_dicts = nullptr;
-    std::unique_ptr<PersistentIndexSstableStreamBuilder> _pk_sst_builder;
-    MutableColumnPtr pk_column;
-    Schema _pkey_schema;
-    size_t _key_size = 0;
-    uint32_t _sst_rowid = 0;
 };
 
 class VerticalGeneralTabletWriter : public TabletWriter {
@@ -146,6 +163,7 @@ protected:
 
     uint32_t _max_rows_per_segment = 0;
     std::vector<std::shared_ptr<SegmentWriter>> _segment_writers;
+    std::vector<std::unique_ptr<PkTabletSSTWriter>> _pk_sst_writers;
     size_t _current_writer_index = 0;
 
     static constexpr int64_t kDefaultTimeoutForAsyncWriteSegment = 1 * 60 * 1000L; // 1 minutes

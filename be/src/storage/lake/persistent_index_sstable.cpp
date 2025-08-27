@@ -88,6 +88,22 @@ Status PersistentIndexSstable::multi_get(const Slice* keys, const KeyIndexSet& k
         if (!index_value_with_ver_pb.ParseFromString(index_value_with_vers[i])) {
             return Status::InternalError("parse index value info failed");
         }
+        // Check if this rowid is already filtered by delvec
+        if (_delvec) {
+            if (_delvec->roaring()->contains(index_value_with_ver_pb.values(0).rowid())) {
+                ++i;
+                continue;
+            }
+        }
+        // fill shared rssid & version if have
+        if (_sstable_pb.has_shared_version() && _sstable_pb.shared_version() > 0) {
+            DCHECK(_sstable_pb.has_shared_rssid());
+            for (size_t j = 0; j < index_value_with_ver_pb.values_size(); ++j) {
+                index_value_with_ver_pb.mutable_values(j)->set_rssid(_sstable_pb.shared_rssid());
+                index_value_with_ver_pb.mutable_values(j)->set_version(_sstable_pb.shared_version());
+            }
+        }
+
         if (index_value_with_ver_pb.values_size() > 0) {
             if (version < 0) {
                 values[key_index] = build_index_value(index_value_with_ver_pb.values(0));
@@ -120,7 +136,7 @@ PersistentIndexSstableStreamBuilder::PersistentIndexSstableStreamBuilder(std::un
     _table_builder = std::make_unique<sstable::TableBuilder>(options, _wf.get());
 }
 
-Status PersistentIndexSstableStreamBuilder::add(const Slice& key, const IndexValue& value, int64_t version) {
+Status PersistentIndexSstableStreamBuilder::add(const Slice& key) {
     if (_finished) {
         return Status::InvalidArgument("Builder already finished");
     }
@@ -131,40 +147,7 @@ Status PersistentIndexSstableStreamBuilder::add(const Slice& key, const IndexVal
 
     IndexValuesWithVerPB index_value_pb;
     auto* val = index_value_pb.add_values();
-    val->set_version(version);
-    val->set_rssid(value.get_rssid());
-    val->set_rowid(value.get_rowid());
-
-    _table_builder->Add(key, Slice(index_value_pb.SerializeAsString()));
-    _status = _table_builder->status();
-    return _status;
-}
-
-Status PersistentIndexSstableStreamBuilder::add(const Slice& key, const IndexValueWithVer& value_with_ver) {
-    return add(key, value_with_ver.second, value_with_ver.first);
-}
-
-Status PersistentIndexSstableStreamBuilder::add_multiple_versions(const Slice& key,
-                                                                  const std::vector<IndexValueWithVer>& values) {
-    if (_finished) {
-        return Status::InvalidArgument("Builder already finished");
-    }
-
-    if (!_status.ok()) {
-        return _status;
-    }
-
-    if (values.empty()) {
-        return Status::InvalidArgument("Values cannot be empty");
-    }
-
-    IndexValuesWithVerPB index_value_pb;
-    for (const auto& value_with_ver : values) {
-        auto* val = index_value_pb.add_values();
-        val->set_version(value_with_ver.first);
-        val->set_rssid(value_with_ver.second.get_rssid());
-        val->set_rowid(value_with_ver.second.get_rowid());
-    }
+    val->set_rowid(_sst_rowid++);
 
     _table_builder->Add(key, Slice(index_value_pb.SerializeAsString()));
     _status = _table_builder->status();

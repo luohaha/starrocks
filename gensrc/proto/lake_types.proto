@@ -221,6 +221,8 @@ message TxnLogPB {
         // x and y might be new segments
         optional int32 new_segment_offset = 6;
         optional int32 new_segment_count = 7;
+        repeated FileMetaPB ssts = 8;
+        repeated bytes sst_encryption_metas = 9;
     }
 
     message OpSchemaChange {

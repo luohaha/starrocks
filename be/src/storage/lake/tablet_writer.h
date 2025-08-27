@@ -145,20 +145,18 @@ public:
 
     const DictColumnsValidMap& global_dict_columns_valid_info() const { return _global_dict_columns_valid_info; }
 
-    bool can_skip_pk_write() {
-        if (!config::enable_bypass_pk_memtable) {
+    bool need_generate_sst() {
+        if (!config::enable_bypass_pk_memtable || _schema->keys_type() != KeysType::PRIMARY_KEYS) {
             return false;
         }
-        // if only one key column, or all key columns are varchar type, we can skip pk write
-        if (tablet_schema()->num_key_columns() == 1) {
+        if (tablet_schema()->num_key_columns() > 1) {
             return true;
         }
-        for (int i = 0; i < tablet_schema()->num_key_columns(); i++) {
-            if (tablet_schema()->column(i).type() != LogicalType::TYPE_VARCHAR) {
-                return false;
-            }
+        if (tablet_schema()->column(0).type() == LogicalType::TYPE_VARCHAR ||
+            tablet_schema()->column(0).type() == LogicalType::TYPE_CHAR) {
+            return true;
         }
-        return true;
+        return false;
     }
 
 protected:

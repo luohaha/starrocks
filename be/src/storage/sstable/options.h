@@ -131,6 +131,11 @@ struct ReadOptions {
     ReadIOStat* stat = nullptr;
 
     SstablePredicateSPtr predicate = nullptr;
+
+    // When sst was generated during data write & compaction process,
+    // these two fields are used to indicate the shared rssid & version
+    uint32_t shared_rssid = 0;
+    int64_t shared_version = 0;
 };
 
 // Options that control write operations

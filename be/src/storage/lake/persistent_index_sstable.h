@@ -72,15 +72,14 @@ private:
     std::unique_ptr<sstable::FilterPolicy> _filter_policy{nullptr};
     std::unique_ptr<RandomAccessFile> _rf{nullptr};
     PersistentIndexSstablePB _sstable_pb;
+    DelVectorPtr _delvec;
 };
 
 class PersistentIndexSstableStreamBuilder {
 public:
     explicit PersistentIndexSstableStreamBuilder(std::unique_ptr<WritableFile> wf, const std::string& encryption_meta);
 
-    Status add(const Slice& key, const IndexValue& value, int64_t version = -1);
-    Status add(const Slice& key, const IndexValueWithVer& value_with_ver);
-    Status add_multiple_versions(const Slice& key, const std::vector<IndexValueWithVer>& values);
+    Status add(const Slice& key);
     Status finish(uint64_t* file_size = nullptr);
 
     uint64_t num_entries() const;
@@ -94,6 +93,7 @@ private:
     Status _status;
     bool _finished;
     std::string _encryption_meta;
+    uint32_t _sst_rowid = 0;
 };
 
 } // namespace lake

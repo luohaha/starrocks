@@ -45,6 +45,9 @@ HorizontalPkTabletWriter::HorizontalPkTabletWriter(TabletManager* tablet_mgr, in
             _rows_mapper_builder = std::make_unique<RowsMapperBuilder>(rows_mapper_filename.value());
         }
     }
+    if (need_generate_sst()) {
+        _pk_sst_writer = std::make_unique<PkTabletSSTWriter>(tablet_schema(), tablet_mgr, tablet_id);
+    }
 }
 
 HorizontalPkTabletWriter::~HorizontalPkTabletWriter() = default;
@@ -52,6 +55,9 @@ HorizontalPkTabletWriter::~HorizontalPkTabletWriter() = default;
 Status HorizontalPkTabletWriter::write(const Chunk& data, const std::vector<uint64_t>& rssid_rowids,
                                        SegmentPB* segment) {
     RETURN_IF_ERROR(HorizontalGeneralTabletWriter::write(data, segment));
+    if (_seg_writer) {
+        RETURN_IF_ERROR(_pk_sst_writer->append_sst_record(data));
+    }
     if (_rows_mapper_builder != nullptr) {
         RETURN_IF_ERROR(_rows_mapper_builder->append(rssid_rowids));
     }
@@ -113,11 +119,17 @@ Status HorizontalPkTabletWriter::flush_segment_writer(SegmentPB* segment) {
         }
         _seg_writer.reset();
     }
-    if (_pk_sst_builder != nullptr) {
-        RETURN_IF_ERROR(_pk_sst_builder->finish());
-        auto sst_file_info = _pk_sst_builder->file_info();
+    if (_pk_sst_writer) {
+        ASSIGN_OR_RETURN(auto sst_file_info, _pk_sst_writer->flush_sst_writer());
         _ssts.emplace_back(sst_file_info);
-        _pk_sst_builder.reset();
+    }
+    return Status::OK();
+}
+
+Status HorizontalPkTabletWriter::reset_segment_writer(bool eos) {
+    RETURN_IF_ERROR(HorizontalGeneralTabletWriter::reset_segment_writer(eos));
+    if (_pk_sst_writer) {
+        RETURN_IF_ERROR(_pk_sst_writer->reset_sst_writer(_location_provider, _fs));
     }
     return Status::OK();
 }

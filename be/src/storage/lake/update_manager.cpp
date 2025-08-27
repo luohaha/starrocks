@@ -277,11 +277,9 @@ Status UpdateManager::publish_primary_key_tablet(const TxnLogPB_OpWrite& op_writ
         state.release_segment(segment_id);
         _update_state_cache.update_object_size(state_entry, state.memory_usage());
         if (op_write.ssts_size() > 0) {
-            if (op_write.sst_encryption_metas_size() != op_write.ssts_size()) {
-                RETURN_IF_ERROR(index.add_sst(op_write.ssts(segment_id), ""));
-            } else {
-                RETURN_IF_ERROR(index.add_sst(op_write.ssts(segment_id), op_write.sst_encryption_metas(segment_id)));
-            }
+            DCHECK(op_write.ssts_size() == op_write.sst_encryption_metas_size());
+            RETURN_IF_ERROR(index.add_sst(op_write.ssts(segment_id), op_write.sst_encryption_metas(segment_id),
+                                          rowset_id + segment_id, metadata->version()));
         }
     }
 
@@ -398,8 +396,13 @@ Status UpdateManager::_do_update(uint32_t rowset_id, int32_t upsert_idx, const S
         auto current = upsert->current();
         if (skip_pk_write) {
             // use get instead of upsert
-            std::vector<uint64_t> rowids(current.first->size());
-            RETURN_IF_ERROR(index.get(*current.first, &rowids));
+            std::vector<uint64_t> old_values(current.first->size(), NullIndexValue);
+            RETURN_IF_ERROR(index.get(*current.first, &old_values));
+            for (unsigned long old : old_values) {
+                if (old != NullIndexValue) {
+                    (*new_deletes)[(uint32_t)(old >> 32)].push_back((uint32_t)(old & ROWID_MASK));
+                }
+            }
         } else {
             RETURN_IF_ERROR(index.upsert(rowset_id + upsert_idx, current.second, *current.first, new_deletes));
         }
@@ -784,10 +787,16 @@ Status UpdateManager::light_publish_primary_compaction(const TxnLogPB_OpCompacti
             *std::max_element(op_compaction.input_rowsets().begin(), op_compaction.input_rowsets().end());
 
     // 2. update primary index, and generate delete info.
-    auto resolver = std::make_unique<LakePrimaryKeyCompactionConflictResolver>(&metadata, &output_rowset, _tablet_mgr,
-                                                                               builder, &index, txn_id, base_version,
-                                                                               &segment_id_to_add_dels, &delvecs);
+    auto resolver = std::make_unique<LakePrimaryKeyCompactionConflictResolver>(
+            &metadata, &output_rowset, _tablet_mgr, builder, &index, txn_id, base_version, &segment_id_to_add_dels,
+            &delvecs, op_compaction.ssts_size() > 0);
     RETURN_IF_ERROR(resolver->execute());
+    // add ssts to index
+    for (int i = 0; i < op_compaction.ssts_size(); i++) {
+        DCHECK(op_compaction.ssts_size() == op_compaction.sst_encryption_metas_size());
+        RETURN_IF_ERROR(index.add_sst(op_compaction.ssts(i), op_compaction.sst_encryption_metas(i),
+                                      metadata.next_rowset_id() + i, metadata.version()));
+    }
     _index_cache.update_object_size(index_entry, index.memory_usage());
     // 3. update TabletMeta and write to meta file
     for (auto&& each : delvecs) {

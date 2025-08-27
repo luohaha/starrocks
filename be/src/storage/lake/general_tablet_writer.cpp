@@ -25,7 +25,6 @@
 #include "serde/column_array_serde.h"
 #include "storage/chunk_helper.h"
 #include "storage/lake/filenames.h"
-#include "storage/lake/persistent_index_sstable.h"
 #include "storage/lake/tablet_manager.h"
 #include "storage/lake/vacuum.h"
 #include "storage/primary_index.h"
@@ -58,6 +57,60 @@ void collect_writer_stats(OlapWriterStatistics& writer_stats, SegmentWriter* seg
     }
 }
 
+Status PkTabletSSTWriter::append_sst_record(const Chunk& data) {
+    if (_pk_sst_builder != nullptr) {
+        if (_pk_column == nullptr) {
+            vector<uint32_t> pk_columns;
+            for (size_t i = 0; i < _tablet_schema_ptr->num_key_columns(); i++) {
+                pk_columns.push_back((uint32_t)i);
+            }
+            _pkey_schema = ChunkHelper::convert_schema(_tablet_schema_ptr, pk_columns);
+            RETURN_IF_ERROR(PrimaryKeyEncoder::create_column(_pkey_schema, &_pk_column));
+            _key_size = PrimaryKeyEncoder::get_encoded_fixed_size(_pkey_schema);
+        }
+        auto clone_pk_column = _pk_column->clone_empty();
+        TRY_CATCH_BAD_ALLOC(PrimaryKeyEncoder::encode(_pkey_schema, data, 0, data.num_rows(), clone_pk_column.get()));
+        std::vector<Slice> keys;
+        const Slice* vkeys =
+                PrimaryIndex::build_persistent_keys(*clone_pk_column, _key_size, 0, clone_pk_column->size(), &keys);
+        for (size_t i = 0; i < clone_pk_column->size(); i++) {
+            RETURN_IF_ERROR(_pk_sst_builder->add(vkeys[i]));
+        }
+    }
+    return Status::OK();
+}
+
+Status PkTabletSSTWriter::reset_sst_writer(const std::shared_ptr<LocationProvider>& location_provider,
+                                           const std::shared_ptr<FileSystem>& fs) {
+    WritableFileOptions wopts;
+    std::string encryption_meta;
+    if (config::enable_transparent_data_encryption) {
+        ASSIGN_OR_RETURN(auto pair, KeyCache::instance().create_encryption_meta_pair_using_current_kek());
+        wopts.encryption_info = pair.info;
+        encryption_meta = std::move(pair.encryption_meta);
+    }
+    std::unique_ptr<WritableFile> sst_wf;
+    if (location_provider && fs) {
+        ASSIGN_OR_RETURN(sst_wf,
+                         fs->new_writable_file(wopts, location_provider->sst_location(_tablet_id, gen_sst_filename())));
+    } else {
+        ASSIGN_OR_RETURN(sst_wf,
+                         fs::new_writable_file(wopts, _tablet_mgr->sst_location(_tablet_id, gen_sst_filename())));
+    }
+    _pk_sst_builder = std::make_unique<PersistentIndexSstableStreamBuilder>(std::move(sst_wf), encryption_meta);
+    return Status::OK();
+}
+
+StatusOr<FileInfo> PkTabletSSTWriter::flush_sst_writer() {
+    if (_pk_sst_builder == nullptr) {
+        return Status::InternalError("pk sst writer not initialized");
+    }
+    RETURN_IF_ERROR(_pk_sst_builder->finish());
+    auto sst_file_info = _pk_sst_builder->file_info();
+    _pk_sst_builder.reset();
+    return sst_file_info;
+}
+
 HorizontalGeneralTabletWriter::HorizontalGeneralTabletWriter(TabletManager* tablet_mgr, int64_t tablet_id,
                                                              std::shared_ptr<const TabletSchema> schema, int64_t txn_id,
                                                              bool is_compaction, ThreadPool* flush_pool,
@@ -83,25 +136,6 @@ Status HorizontalGeneralTabletWriter::write(const starrocks::Chunk& data, Segmen
         RETURN_IF_ERROR(reset_segment_writer(eos));
     }
     RETURN_IF_ERROR(_seg_writer->append_chunk(data));
-    if (_pk_sst_builder != nullptr) {
-        if (pk_column == nullptr) {
-            vector<uint32_t> pk_columns;
-            for (size_t i = 0; i < tablet_schema()->num_key_columns(); i++) {
-                pk_columns.push_back((uint32_t)i);
-            }
-            _pkey_schema = ChunkHelper::convert_schema(tablet_schema(), pk_columns);
-            RETURN_IF_ERROR(PrimaryKeyEncoder::create_column(_pkey_schema, &pk_column));
-            _key_size = PrimaryKeyEncoder::get_encoded_fixed_size(_pkey_schema);
-        }
-        auto clone_pk_column = pk_column->clone_empty();
-        TRY_CATCH_BAD_ALLOC(PrimaryKeyEncoder::encode(_pkey_schema, data, 0, data.num_rows(), clone_pk_column.get()));
-        std::vector<Slice> keys;
-        const Slice* vkeys =
-                PrimaryIndex::build_persistent_keys(*clone_pk_column, _key_size, 0, clone_pk_column->size(), &keys);
-        for (size_t i = 0; i < clone_pk_column->size(); i++) {
-            RETURN_IF_ERROR(_pk_sst_builder->add(vkeys[i], IndexValue(_sst_rowid++), 0));
-        }
-    }
     _num_rows += data.num_rows();
     return Status::OK();
 }
@@ -173,23 +207,6 @@ Status HorizontalGeneralTabletWriter::reset_segment_writer(bool eos) {
     auto w = std::make_unique<SegmentWriter>(std::move(of), _seg_id++, _schema, opts);
     RETURN_IF_ERROR(w->init());
     _seg_writer = std::move(w);
-    // if is pk table
-    if (tablet_schema()->keys_type() == KeysType::PRIMARY_KEYS && can_skip_pk_write()) {
-        LOG(INFO) << "skip persistent index for tablet " << _tablet_id;
-        std::unique_ptr<WritableFile> sst_wf;
-        if (_location_provider && _fs) {
-            ASSIGN_OR_RETURN(sst_wf, _fs->new_writable_file(
-                                             wopts, _location_provider->sst_location(_tablet_id, gen_sst_filename())));
-        } else {
-            ASSIGN_OR_RETURN(sst_wf,
-                             fs::new_writable_file(wopts, _tablet_mgr->sst_location(_tablet_id, gen_sst_filename())));
-        }
-        _pk_sst_builder =
-                std::make_unique<PersistentIndexSstableStreamBuilder>(std::move(sst_wf), opts.encryption_meta);
-        _sst_rowid = 0;
-    } else {
-        LOG(INFO) << "do not create persistent index for tablet " << _tablet_id;
-    }
     return Status::OK();
 }
 
@@ -267,8 +284,16 @@ Status VerticalGeneralTabletWriter::write_columns(const Chunk& data, const std::
         auto segment_writer = create_segment_writer(column_indexes, is_key);
         if (!segment_writer.ok()) return segment_writer.status();
         _segment_writers.emplace_back(std::move(segment_writer).value());
+        if (need_generate_sst()) {
+            auto sst_writer = std::make_unique<PkTabletSSTWriter>(tablet_schema(), _tablet_mgr, _tablet_id);
+            RETURN_IF_ERROR(sst_writer->reset_sst_writer(_location_provider, _fs));
+            _pk_sst_writers.emplace_back(std::move(sst_writer));
+        }
         _current_writer_index = 0;
         RETURN_IF_ERROR(_segment_writers[_current_writer_index]->append_chunk(data));
+        if (!_pk_sst_writers.empty()) {
+            RETURN_IF_ERROR(_pk_sst_writers[_current_writer_index]->append_sst_record(data));
+        }
     } else if (is_key) {
         // key columns
         if (_segment_writers[_current_writer_index]->num_rows_written() + chunk_num_rows >= _max_rows_per_segment) {
@@ -276,9 +301,17 @@ Status VerticalGeneralTabletWriter::write_columns(const Chunk& data, const std::
             auto segment_writer = create_segment_writer(column_indexes, is_key);
             if (!segment_writer.ok()) return segment_writer.status();
             _segment_writers.emplace_back(std::move(segment_writer).value());
+            if (need_generate_sst()) {
+                auto sst_writer = std::make_unique<PkTabletSSTWriter>(tablet_schema(), _tablet_mgr, _tablet_id);
+                RETURN_IF_ERROR(sst_writer->reset_sst_writer(_location_provider, _fs));
+                _pk_sst_writers.emplace_back(std::move(sst_writer));
+            }
             ++_current_writer_index;
         }
         RETURN_IF_ERROR(_segment_writers[_current_writer_index]->append_chunk(data));
+        if (!_pk_sst_writers.empty()) {
+            RETURN_IF_ERROR(_pk_sst_writers[_current_writer_index]->append_sst_record(data));
+        }
     } else {
         // non key columns
         uint32_t num_rows_written = _segment_writers[_current_writer_index]->num_rows_written();
@@ -363,6 +396,11 @@ Status VerticalGeneralTabletWriter::finish(SegmentPB* segment) {
     if (_segment_writer_finalize_token != nullptr) {
         _segment_writer_finalize_token.reset();
     }
+    for (auto& pk_sst_writer : _pk_sst_writers) {
+        ASSIGN_OR_RETURN(auto sst_file_info, pk_sst_writer->flush_sst_writer());
+        _ssts.emplace_back(sst_file_info);
+    }
+    _pk_sst_writers.clear();
     _finished = true;
     return Status::OK();
 }

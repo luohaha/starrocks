@@ -49,6 +49,13 @@ Status KeyValueMerger::merge(const sstable::Iterator* iter_ptr) {
     if (index_value_ver.values_size() == 0) {
         return Status::OK();
     }
+    // fill shared version & rssid if have
+    if (iter_ptr->shared_version() > 0) {
+        for (size_t i = 0; i < index_value_ver.values_size(); ++i) {
+            index_value_ver.mutable_values(i)->set_version(iter_ptr->shared_version());
+            index_value_ver.mutable_values(i)->set_rssid(iter_ptr->shared_rssid());
+        }
+    }
 
     /*
      * Do not distinguish between base compaction and cumulative compaction here.
@@ -248,7 +255,8 @@ Status LakePersistentIndex::minor_compact() {
     return Status::OK();
 }
 
-Status LakePersistentIndex::add_sst(const FileMetaPB& sst_meta, const std::string& encryption_meta) {
+Status LakePersistentIndex::add_sst(const FileMetaPB& sst_meta, const std::string& encryption_meta, uint32_t rssid,
+                                    int64_t version) {
     auto sstable = std::make_unique<PersistentIndexSstable>();
     RandomAccessFileOptions opts;
     if (!encryption_meta.empty()) {
@@ -261,6 +269,8 @@ Status LakePersistentIndex::add_sst(const FileMetaPB& sst_meta, const std::strin
     PersistentIndexSstablePB sstable_pb;
     sstable_pb.set_filename(sst_meta.name());
     sstable_pb.set_filesize(sst_meta.size());
+    sstable_pb.set_shared_rssid(rssid);
+    sstable_pb.set_shared_version(version);
     sstable_pb.set_encryption_meta(encryption_meta);
     auto* block_cache = _tablet_mgr->update_mgr()->block_cache();
     if (block_cache == nullptr) {
@@ -469,6 +479,8 @@ Status LakePersistentIndex::prepare_merging_iterator(
             ASSIGN_OR_RETURN(read_options.predicate,
                              sstable::SstablePredicate::create(metadata.schema(), sstable_pb.predicate()));
         }
+        read_options.shared_rssid = sstable_pb.shared_rssid();
+        read_options.shared_version = sstable_pb.shared_version();
         sstable::Iterator* iter = merging_sstable->new_iterator(read_options);
         iters.emplace_back(iter);
         // add input sstable.

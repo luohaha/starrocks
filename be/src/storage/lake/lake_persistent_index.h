@@ -137,7 +137,7 @@ public:
 
     Status minor_compact();
 
-    Status add_sst(const FileMetaPB& sst_meta, const std::string& encryption_meta);
+    Status add_sst(const FileMetaPB& sst_meta, const std::string& encryption_meta, uint32_t rssid, int64_t version);
 
     static Status major_compact(TabletManager* tablet_mgr, const TabletMetadata& metadata, TxnLogPB* txn_log);
 
