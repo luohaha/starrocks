@@ -143,6 +143,11 @@ public:
         return current_->shared_version();
     }
 
+    DelVectorPtr delvec() const override {
+        assert(Valid());
+        return current_->delvec();
+    }
+
 private:
     // Which direction is the iterator moving?
     enum Direction { kForward, kReverse };

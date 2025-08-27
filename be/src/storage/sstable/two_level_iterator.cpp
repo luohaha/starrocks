@@ -126,6 +126,7 @@ public:
 
     uint32_t shared_rssid() const override { return options_.shared_rssid; };
     int64_t shared_version() const override { return options_.shared_version; };
+    DelVectorPtr delvec() const override { return options_.delvec; };
 
 private:
     void SaveError(const Status& s) {

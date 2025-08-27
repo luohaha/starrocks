@@ -49,6 +49,8 @@ public:
     Status init(std::unique_ptr<RandomAccessFile> rf, const PersistentIndexSstablePB& sstable_pb, Cache* cache,
                 bool need_filter = true);
 
+    Status load_delvec(TabletManager* tablet_mgr, int64_t tablet_id);
+
     static Status build_sstable(const phmap::btree_map<std::string, IndexValueWithVer, std::less<>>& map,
                                 WritableFile* wf, uint64_t* filesz);
 
@@ -66,6 +68,8 @@ public:
     const PersistentIndexSstablePB& sstable_pb() const { return _sstable_pb; }
 
     size_t memory_usage() const;
+
+    DelVectorPtr delvec() const { return _delvec; }
 
 private:
     std::unique_ptr<sstable::Table> _sst{nullptr};

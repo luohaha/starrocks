@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 
+#include "storage/del_vector.h"
 #include "storage/sstable/sstable_predicate_fwd.h"
 
 namespace starrocks {
@@ -136,6 +137,9 @@ struct ReadOptions {
     // these two fields are used to indicate the shared rssid & version
     uint32_t shared_rssid = 0;
     int64_t shared_version = 0;
+
+    // Mark rows that have been deleted in this sst
+    DelVectorPtr delvec = nullptr;
 };
 
 // Options that control write operations

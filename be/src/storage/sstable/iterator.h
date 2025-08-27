@@ -67,6 +67,7 @@ public:
     // Return the shared rssid & version the iterator contains.
     virtual uint32_t shared_rssid() const { return 0; };
     virtual int64_t shared_version() const { return 0; };
+    virtual DelVectorPtr delvec() const override { return nullptr; };
 
     /*
      * Return predicate the iterator contains.
