@@ -36,8 +36,7 @@ namespace starrocks::lake {
 
 Status SegmentPKEncodeResult::_load() {
     // reset pk_column to empty
-    auto clone_pk_column = pk_column->clone_empty();
-    pk_column = std::move(clone_pk_column);
+    pk_column = std::move(empty_pk_column->clone_empty());
     ChunkUniquePtr chunk_shared_ptr;
     TRY_CATCH_BAD_ALLOC(chunk_shared_ptr = ChunkHelper::new_chunk(_pkey_schema, 4096));
     auto chunk = chunk_shared_ptr.get();
@@ -71,7 +70,7 @@ Status SegmentPKEncodeResult::init(const ChunkIteratorPtr& iter, const Schema& p
     _pkey_schema = pkey_schema;
     _lazy_load = lazy_load;
     _begin_rowid_offsets.push_back(0);
-    RETURN_IF_ERROR(PrimaryKeyEncoder::create_column(_pkey_schema, &pk_column));
+    RETURN_IF_ERROR(PrimaryKeyEncoder::create_column(_pkey_schema, &empty_pk_column));
     _status = _load();
     if (_status.ok()) {
         TRY_CATCH_BAD_ALLOC(pk_column->raw_data());
@@ -95,8 +94,8 @@ void SegmentPKEncodeResult::next() {
     }
 }
 
-std::pair<Column*, size_t> SegmentPKEncodeResult::current() {
-    return std::make_pair(pk_column.get(), _begin_rowid_offsets[_current_pk_column_idx]);
+std::pair<ColumnPtr, size_t> SegmentPKEncodeResult::current() {
+    return std::make_pair(ColumnPtr(pk_column), _begin_rowid_offsets[_current_pk_column_idx]);
 }
 
 void SegmentPKEncodeResult::close() {

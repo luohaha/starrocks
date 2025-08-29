@@ -17,6 +17,7 @@
 #include <butil/time.h> // NOLINT
 
 #include "fs/fs.h"
+#include "fs/key_cache.h"
 #include "gen_cpp/types.pb.h"
 #include "storage/lake/lake_delvec_loader.h"
 #include "storage/lake/utils.h"
@@ -38,6 +39,7 @@ Status PersistentIndexSstable::init(std::unique_ptr<RandomAccessFile> rf, const 
     _sst.reset(table);
     _rf = std::move(rf);
     _sstable_pb.CopyFrom(sstable_pb);
+    _cache = cache;
     return Status::OK();
 }
 
@@ -86,6 +88,86 @@ Status PersistentIndexSstable::multi_get(const Slice* keys, const KeyIndexSet& k
     // will always meet the condition.
     auto start_ts = butil::gettimeofday_us();
     RETURN_IF_ERROR(_sst->MultiGet(options, keys, key_indexes.begin(), key_indexes.end(), &index_value_with_vers));
+    auto end_ts = butil::gettimeofday_us();
+    TRACE_COUNTER_INCREMENT("multi_get_us", end_ts - start_ts);
+    TRACE_COUNTER_INCREMENT("read_block_hit_cache_cnt", stat.block_cnt_from_cache);
+    TRACE_COUNTER_INCREMENT("read_block_miss_cache_cnt", stat.block_cnt_from_file);
+    size_t i = 0;
+    for (auto& key_index : key_indexes) {
+        // Index_value_with_vers is empty means key is not found in sst.
+        // Value in sst can not be empty.
+        if (index_value_with_vers[i].empty()) {
+            ++i;
+            continue;
+        }
+        IndexValuesWithVerPB index_value_with_ver_pb;
+        if (!index_value_with_ver_pb.ParseFromString(index_value_with_vers[i])) {
+            return Status::InternalError("parse index value info failed");
+        }
+        // Check if this rowid is already filtered by delvec
+        if (_delvec) {
+            if (_delvec->roaring()->contains(index_value_with_ver_pb.values(0).rowid())) {
+                ++i;
+                continue;
+            }
+        }
+        // fill shared rssid & version if have
+        if (_sstable_pb.has_shared_version() && _sstable_pb.shared_version() > 0) {
+            DCHECK(_sstable_pb.has_shared_rssid());
+            for (size_t j = 0; j < index_value_with_ver_pb.values_size(); ++j) {
+                index_value_with_ver_pb.mutable_values(j)->set_rssid(_sstable_pb.shared_rssid());
+                index_value_with_ver_pb.mutable_values(j)->set_version(_sstable_pb.shared_version());
+            }
+        }
+
+        if (index_value_with_ver_pb.values_size() > 0) {
+            if (version < 0) {
+                values[key_index] = build_index_value(index_value_with_ver_pb.values(0));
+                found_key_indexes->insert(key_index);
+            } else {
+                for (size_t j = 0; j < index_value_with_ver_pb.values_size(); ++j) {
+                    if (index_value_with_ver_pb.values(j).version() == version) {
+                        values[key_index] = build_index_value(index_value_with_ver_pb.values(j));
+                        found_key_indexes->insert(key_index);
+                        break;
+                    }
+                }
+            }
+        }
+        ++i;
+    }
+    return Status::OK();
+}
+
+Status PersistentIndexSstable::multi_get_thread_safe(const Slice* keys, const KeyIndexSet& key_indexes, int64_t version,
+                                                     IndexValue* values, KeyIndexSet* found_key_indexes) const {
+    // 1. create RandomAccessFile copy from _rf.
+    RandomAccessFileOptions opts;
+    if (!_sstable_pb.encryption_meta().empty()) {
+        ASSIGN_OR_RETURN(auto info, KeyCache::instance().unwrap_encryption_meta(_sstable_pb.encryption_meta()));
+        opts.encryption_info = std::move(info);
+    }
+    ASSIGN_OR_RETURN(auto rf, fs::new_random_access_file(opts, _rf->filename()));
+    // 2. open sstable from rf.
+    sstable::Options options;
+    if (_filter_policy != nullptr) {
+        options.filter_policy = _filter_policy.get();
+    }
+    options.block_cache = _cache;
+    sstable::Table* table;
+    RETURN_IF_ERROR(sstable::Table::Open(options, rf.get(), _sstable_pb.filesize(), &table));
+    std::unique_ptr<sstable::Table> sst(table);
+    // 3. do multi_get on this sst.
+    std::vector<std::string> index_value_with_vers(key_indexes.size());
+    sstable::ReadIOStat stat;
+    sstable::ReadOptions read_options;
+    read_options.stat = &stat;
+    // Currently, there is no need to set predicate for MultiGet of persistent index sstable. Because predicate
+    // only used for sstable compaction to filter out some keys for tablet split purpose and such keys can not
+    // be read by the persistent index by designed. So even we provide a predicate, all keys read by multi_get
+    // will always meet the condition.
+    auto start_ts = butil::gettimeofday_us();
+    RETURN_IF_ERROR(sst->MultiGet(read_options, keys, key_indexes.begin(), key_indexes.end(), &index_value_with_vers));
     auto end_ts = butil::gettimeofday_us();
     TRACE_COUNTER_INCREMENT("multi_get_us", end_ts - start_ts);
     TRACE_COUNTER_INCREMENT("read_block_hit_cache_cnt", stat.block_cnt_from_cache);

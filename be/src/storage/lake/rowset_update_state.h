@@ -92,13 +92,14 @@ public:
     Status status();
     void close();
     // <Current pk column, begin rowid>
-    std::pair<Column*, size_t> current();
+    std::pair<ColumnPtr, size_t> current();
 
     // Return the memory usage of this encode pk column.
     // If _lazy_load is true, return 0, because memory allocation is lazy.
     size_t memory_usage() const { return _memory_usage; }
 
     // For large segment, we need to load segment file piece by piece.
+    MutableColumnPtr empty_pk_column;
     MutableColumnPtr pk_column;
 
 private:

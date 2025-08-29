@@ -55,12 +55,11 @@ public:
 
 protected:
     Status flush_segment_writer(SegmentPB* segment = nullptr) override;
-    Status reset_segment_writer(bool eos);
+    Status reset_segment_writer(bool eos) override;
 
 private:
     std::unique_ptr<RowsetTxnMetaPB> _rowset_txn_meta;
     std::unique_ptr<RowsMapperBuilder> _rows_mapper_builder;
-    std::unique_ptr<PkTabletSSTWriter> _pk_sst_writer;
 };
 
 class VerticalPkTabletWriter : public VerticalGeneralTabletWriter {

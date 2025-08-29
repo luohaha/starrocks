@@ -58,24 +58,25 @@ void collect_writer_stats(OlapWriterStatistics& writer_stats, SegmentWriter* seg
 }
 
 Status PkTabletSSTWriter::append_sst_record(const Chunk& data) {
-    if (_pk_sst_builder != nullptr) {
-        if (_pk_column == nullptr) {
-            vector<uint32_t> pk_columns;
-            for (size_t i = 0; i < _tablet_schema_ptr->num_key_columns(); i++) {
-                pk_columns.push_back((uint32_t)i);
-            }
-            _pkey_schema = ChunkHelper::convert_schema(_tablet_schema_ptr, pk_columns);
-            RETURN_IF_ERROR(PrimaryKeyEncoder::create_column(_pkey_schema, &_pk_column));
-            _key_size = PrimaryKeyEncoder::get_encoded_fixed_size(_pkey_schema);
+    if (_pk_sst_builder == nullptr) {
+        return Status::InternalError("pk sst writer not initialized");
+    }
+    if (_pk_column == nullptr) {
+        vector<uint32_t> pk_columns;
+        for (size_t i = 0; i < _tablet_schema_ptr->num_key_columns(); i++) {
+            pk_columns.push_back((uint32_t)i);
         }
-        auto clone_pk_column = _pk_column->clone_empty();
-        TRY_CATCH_BAD_ALLOC(PrimaryKeyEncoder::encode(_pkey_schema, data, 0, data.num_rows(), clone_pk_column.get()));
-        std::vector<Slice> keys;
-        const Slice* vkeys =
-                PrimaryIndex::build_persistent_keys(*clone_pk_column, _key_size, 0, clone_pk_column->size(), &keys);
-        for (size_t i = 0; i < clone_pk_column->size(); i++) {
-            RETURN_IF_ERROR(_pk_sst_builder->add(vkeys[i]));
-        }
+        _pkey_schema = ChunkHelper::convert_schema(_tablet_schema_ptr, pk_columns);
+        RETURN_IF_ERROR(PrimaryKeyEncoder::create_column(_pkey_schema, &_pk_column));
+        _key_size = PrimaryKeyEncoder::get_encoded_fixed_size(_pkey_schema);
+    }
+    auto clone_pk_column = _pk_column->clone_empty();
+    TRY_CATCH_BAD_ALLOC(PrimaryKeyEncoder::encode(_pkey_schema, data, 0, data.num_rows(), clone_pk_column.get()));
+    std::vector<Slice> keys;
+    const Slice* vkeys =
+            PrimaryIndex::build_persistent_keys(*clone_pk_column, _key_size, 0, clone_pk_column->size(), &keys);
+    for (size_t i = 0; i < clone_pk_column->size(); i++) {
+        RETURN_IF_ERROR(_pk_sst_builder->add(vkeys[i]));
     }
     return Status::OK();
 }
@@ -137,6 +138,9 @@ Status HorizontalGeneralTabletWriter::write(const starrocks::Chunk& data, Segmen
     }
     RETURN_IF_ERROR(_seg_writer->append_chunk(data));
     _num_rows += data.num_rows();
+    if (_pk_sst_writer != nullptr) {
+        RETURN_IF_ERROR(_pk_sst_writer->append_sst_record(data));
+    }
     return Status::OK();
 }
 

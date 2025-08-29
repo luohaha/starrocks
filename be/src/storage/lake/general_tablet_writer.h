@@ -108,6 +108,7 @@ protected:
     std::unique_ptr<SegmentWriter> _seg_writer;
     BundleWritableFileContext* _bundle_file_context = nullptr;
     GlobalDictByNameMaps* _global_dicts = nullptr;
+    std::unique_ptr<PkTabletSSTWriter> _pk_sst_writer;
 };
 
 class VerticalGeneralTabletWriter : public TabletWriter {

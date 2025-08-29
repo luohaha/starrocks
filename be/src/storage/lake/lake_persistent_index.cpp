@@ -263,6 +263,9 @@ Status LakePersistentIndex::minor_compact() {
 
 Status LakePersistentIndex::add_sst(const FileMetaPB& sst_meta, const std::string& encryption_meta, uint32_t rssid,
                                     int64_t version) {
+    if (!_memtable->empty()) {
+        RETURN_IF_ERROR(flush_memtable());
+    }
     auto sstable = std::make_unique<PersistentIndexSstable>();
     RandomAccessFileOptions opts;
     if (!encryption_meta.empty()) {
@@ -278,7 +281,7 @@ Status LakePersistentIndex::add_sst(const FileMetaPB& sst_meta, const std::strin
     sstable_pb.set_shared_rssid(rssid);
     sstable_pb.set_shared_version(version);
     sstable_pb.set_encryption_meta(encryption_meta);
-    sstable_pb.set_max_rss_rowid((rssid << 32) | UINT32_MAX); // all rows are contained
+    sstable_pb.set_max_rss_rowid((static_cast<uint64_t>(rssid) << 32) | UINT32_MAX); // all rows are contained
     auto* block_cache = _tablet_mgr->update_mgr()->block_cache();
     if (block_cache == nullptr) {
         return Status::InternalError("Block cache is null.");
@@ -307,7 +310,7 @@ Status LakePersistentIndex::get_from_sstables(size_t n, const Slice* keys, Index
     }
     for (auto iter = _sstables.rbegin(); iter != _sstables.rend(); ++iter) {
         KeyIndexSet found_key_indexes;
-        RETURN_IF_ERROR((*iter)->multi_get(keys, *key_indexes, version, values, &found_key_indexes));
+        RETURN_IF_ERROR((*iter)->multi_get_thread_safe(keys, *key_indexes, version, values, &found_key_indexes));
         set_difference(key_indexes, found_key_indexes);
         if (key_indexes->empty()) {
             break;

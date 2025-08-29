@@ -392,20 +392,40 @@ Status UpdateManager::publish_column_mode_partial_update(const TxnLogPB_OpWrite&
 Status UpdateManager::_do_update(uint32_t rowset_id, int32_t upsert_idx, const SegmentPKEncodeResultPtr& upsert,
                                  PrimaryIndex& index, DeletesMap* new_deletes, bool skip_pk_write) {
     TRACE_COUNTER_SCOPE_LATENCY_US("do_update_latency_us");
+    std::vector<std::thread> scan_pk_idx_workers;
+    Status workers_status = Status::OK();
+    std::mutex workers_mutex;
     for (; !upsert->done(); upsert->next()) {
         auto current = upsert->current();
         if (skip_pk_write) {
             // use get instead of upsert
-            std::vector<uint64_t> old_values(current.first->size(), NullIndexValue);
-            RETURN_IF_ERROR(index.get(*current.first, &old_values));
-            for (unsigned long old : old_values) {
-                if (old != NullIndexValue) {
-                    (*new_deletes)[(uint32_t)(old >> 32)].push_back((uint32_t)(old & ROWID_MASK));
-                }
-            }
+            scan_pk_idx_workers.emplace_back(
+                    [&](ColumnPtr col) {
+                        std::vector<uint64_t> old_values(col->size(), NullIndexValue);
+                        Status st = index.get(*col, &old_values);
+                        std::lock_guard<std::mutex> lg(workers_mutex);
+                        if (!st.ok()) {
+                            workers_status = st;
+                            return;
+                        }
+                        for (unsigned long old : old_values) {
+                            if (old != NullIndexValue) {
+                                (*new_deletes)[(uint32_t)(old >> 32)].push_back((uint32_t)(old & ROWID_MASK));
+                            }
+                        }
+                    },
+                    current.first);
         } else {
             RETURN_IF_ERROR(index.upsert(rowset_id + upsert_idx, current.second, *current.first, new_deletes));
         }
+    }
+    LOG(INFO) << "PK use " << scan_pk_idx_workers.size() << " threads to scan pk";
+    // join workers
+    for (auto& t : scan_pk_idx_workers) {
+        t.join();
+    }
+    if (!workers_status.ok()) {
+        return workers_status;
     }
     return upsert->status();
 }

@@ -63,6 +63,9 @@ public:
     Status multi_get(const Slice* keys, const KeyIndexSet& key_indexes, int64_t version, IndexValue* values,
                      KeyIndexSet* found_key_indexes) const;
 
+    Status multi_get_thread_safe(const Slice* keys, const KeyIndexSet& key_indexes, int64_t version, IndexValue* values,
+                                 KeyIndexSet* found_key_indexes) const;
+
     sstable::Iterator* new_iterator(const sstable::ReadOptions& options) { return _sst->NewIterator(options); }
 
     const PersistentIndexSstablePB& sstable_pb() const { return _sstable_pb; }
@@ -77,6 +80,7 @@ private:
     std::unique_ptr<RandomAccessFile> _rf{nullptr};
     PersistentIndexSstablePB _sstable_pb;
     DelVectorPtr _delvec;
+    Cache* _cache = nullptr;
 };
 
 class PersistentIndexSstableStreamBuilder {
@@ -89,6 +93,7 @@ public:
     uint64_t num_entries() const;
     FileInfo file_info() const;
     Status status() const;
+    std::string file_path() const { return _wf->filename(); }
 
 private:
     std::unique_ptr<sstable::TableBuilder> _table_builder;
