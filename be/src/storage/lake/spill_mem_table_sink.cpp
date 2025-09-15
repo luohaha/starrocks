@@ -76,6 +76,8 @@ Status SpillMemTableSink::merge_blocks_to_segments() {
     RETURN_IF(_load_chunk_spiller->empty(), Status::OK());
     // merge process needs to control _writer's flush behavior manually
     _writer->set_auto_flush(false);
+    // When bulk load happens, try to enable pk parallel execution
+    _writer->try_enable_pk_parallel_execution();
 
     SchemaPtr schema = _load_chunk_spiller->schema();
     bool do_agg = schema->keys_type() == KeysType::AGG_KEYS || schema->keys_type() == KeysType::UNIQUE_KEYS;
