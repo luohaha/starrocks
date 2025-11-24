@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "storage/lake/lake_persistent_index_parallel_compact_mgr.h"
 #include "storage/lake/tablet_metadata.h"
 #include "storage/lake/types_fwd.h"
 #include "storage/persistent_index.h"
@@ -24,10 +25,10 @@
 namespace starrocks {
 class TxnLogPB;
 class TxnLogPB_OpCompaction;
+class ThreadPoolToken;
 
 namespace sstable {
 class Iterator;
-class TableBuilder;
 } // namespace sstable
 
 namespace lake {
@@ -38,6 +39,8 @@ class MetaFileBuilder;
 class PersistentIndexMemtable;
 class PersistentIndexSstable;
 class TabletManager;
+class PersistentIndexSstableFileset;
+class LakePersistentIndexParallelCompactMgr;
 
 class KeyValueMerger {
 public:
@@ -117,8 +120,8 @@ public:
     // |values|: value array
     // |old_values|: return old values for updates, or set to NullValue for inserts
     // |stat|: used for collect statistic
-    Status upsert(size_t n, const Slice* keys, const IndexValue* values, IndexValue* old_values,
-                  IOStat* stat = nullptr) override;
+    Status upsert(size_t n, const Slice* keys, const IndexValue* values, IndexValue* old_values, IOStat* stat = nullptr,
+                  ParallelUpsertCB* cb = nullptr) override;
 
     // batch erase
     // |n|: size of key/value array
@@ -167,10 +170,13 @@ public:
 
     Status minor_compact();
 
-    Status ingest_sst(const FileMetaPB& sst_meta, uint32_t rssid, int64_t version, const DelvecPagePB& delvec_page,
-                      DelVectorPtr delvec);
+    Status ingest_sst(const FileMetaPB& sst_meta, const PersistentIndexSstableRangePB& sst_range, uint32_t rssid,
+                      int64_t version, const DelvecPagePB& delvec_page, DelVectorPtr delvec);
 
     static Status major_compact(TabletManager* tablet_mgr, const TabletMetadataPtr& metadata, TxnLogPB* txn_log);
+
+    static Status parallel_major_compact(LakePersistentIndexParallelCompactMgr* compact_mgr, TabletManager* tablet_mgr,
+                                         const TabletMetadataPtr& metadata, TxnLogPB* txn_log);
 
     Status apply_opcompaction(const TxnLogPB_OpCompaction& op_compaction);
 
@@ -180,6 +186,13 @@ public:
                                  const MetaFileBuilder* builder);
 
     size_t memory_usage() const override;
+
+    int32_t current_fileset_index() const { return (int32_t)_sstable_filesets.size() - 1; }
+
+    // During large import, we may have many sst files to ingest and get, so we do parallel compaction to speedup the process.
+    StatusOr<AsyncCompactCBPtr> ingest_sst_compact(lake::LakePersistentIndexParallelCompactMgr* compact_mgr,
+                                                   TabletManager* tablet_mgr, const TabletMetadataPtr& metadata,
+                                                   int32_t fileset_start_idx);
 
     static void pick_sstables_for_merge(const PersistentIndexSstableMetaPB& sstable_meta,
                                         std::vector<PersistentIndexSstablePB>* sstables, bool* merge_base_level);
@@ -191,9 +204,9 @@ public:
     static size_t need_rebuild_file_cnt(const TabletMetadataPB& metadata,
                                         const PersistentIndexSstableMetaPB& sstable_meta);
 
-private:
-    Status flush_memtable();
+    Status flush_memtable(bool force = false);
 
+private:
     bool is_memtable_full() const;
 
     bool too_many_rebuild_files() const;
@@ -206,6 +219,9 @@ private:
     // |version|: version of values
     Status get_from_sstables(size_t n, const Slice* keys, IndexValue* values, KeyIndexSet* key_indexes,
                              int64_t version) const;
+
+    Status get_from_inactive_memtables(size_t n, const Slice* keys, IndexValue* values, KeyIndexSet* key_indexes,
+                                       int64_t version) const;
 
     // rebuild delete operation from rowset.
     Status load_dels(const RowsetPtr& rowset, const Schema& pkey_schema, int64_t rowset_version);
@@ -223,15 +239,20 @@ private:
             std::unique_ptr<sstable::Iterator> iter_ptr, bool base_level_merge, TabletManager* tablet_mgr,
             int64_t tablet_id);
 
+    Status merge_sstable_into_fileset(std::unique_ptr<PersistentIndexSstable>& sstable);
+
 private:
-    std::unique_ptr<PersistentIndexMemtable> _memtable;
+    std::shared_ptr<PersistentIndexMemtable> _memtable;
+    std::vector<std::shared_ptr<PersistentIndexMemtable>> _inactive_memtables;
     TabletManager* _tablet_mgr{nullptr};
     int64_t _tablet_id{0};
     size_t _need_rebuild_file_cnt{0};
-    // The size of sstables is not expected to be too large.
-    // In major compaction, some sstables will be picked to be merged into one.
-    // sstables are ordered with the smaller version on the left.
-    std::vector<std::unique_ptr<PersistentIndexSstable>> _sstables;
+    // Collection of sstable fileset, from old to new.
+    std::vector<std::unique_ptr<PersistentIndexSstableFileset>> _sstable_filesets;
+    // total write bytes
+    size_t _total_write_bytes{0};
+    // total compaction bytes
+    size_t _total_compaction_bytes{0};
 };
 
 } // namespace lake

@@ -112,7 +112,6 @@ private:
     UniqueId _output_fileset_id;
     SeekRange _seek_range;
     AsyncCompactCB* _cb = nullptr;
-
     // output sstable pb
     std::vector<PersistentIndexSstablePB> _output_sstables;
 };

@@ -44,6 +44,12 @@ message PersistentIndexSstableRangePB {
     optional bytes end_key = 2;
 }
 
+message PersistentIndexSstableRangePB {
+    // key range is [start_key, end_key].
+    optional bytes start_key = 1;
+    optional bytes end_key = 2;
+}
+
 message PersistentIndexSstablePB {
     optional int64 version = 1; // Deprecated
     optional string filename = 2;
