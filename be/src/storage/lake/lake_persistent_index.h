@@ -241,8 +241,6 @@ private:
 
     Status merge_sstable_into_fileset(std::unique_ptr<PersistentIndexSstable>& sstable);
 
-    void print_debug_info() const;
-
 private:
     std::shared_ptr<PersistentIndexMemtable> _memtable;
     std::vector<std::shared_ptr<PersistentIndexMemtable>> _inactive_memtables;
@@ -251,10 +249,6 @@ private:
     size_t _need_rebuild_file_cnt{0};
     // Collection of sstable fileset, from old to new.
     std::vector<std::unique_ptr<PersistentIndexSstableFileset>> _sstable_filesets;
-    // total write bytes
-    size_t _total_write_bytes{0};
-    // total compaction bytes
-    size_t _total_compaction_bytes{0};
 };
 
 } // namespace lake

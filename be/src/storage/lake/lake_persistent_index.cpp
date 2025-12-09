@@ -359,8 +359,6 @@ Status LakePersistentIndex::ingest_sst(const FileMetaPB& sst_meta, const Persist
             sstable->init(std::move(rf), sstable_pb, block_cache->cache(), true /* need filter */, std::move(delvec)));
     // try to merge to a existing fileset
     RETURN_IF_ERROR(merge_sstable_into_fileset(sstable));
-    LOG(INFO) << "add sst1 : " << sstable_pb.filename();
-    _total_write_bytes += sst_meta.size();
     TRACE_COUNTER_INCREMENT("ingest_sst_times", 1);
     return Status::OK();
 }
@@ -808,8 +806,6 @@ Status LakePersistentIndex::apply_opcompaction(const TxnLogPB_OpCompaction& op_c
                                           opts, _tablet_mgr->sst_location(_tablet_id, sstable_pb.filename())));
         RETURN_IF_ERROR(sstable->init(std::move(rf), sstable_pb, block_cache->cache()));
         RETURN_IF_ERROR(new_sstable_fileset->init(sstable));
-        LOG(INFO) << "add sst3 : " << sstable_pb.filename();
-        _total_compaction_bytes += sstable_pb.filesize();
     } else {
         DCHECK(!op_compaction.output_sstables().empty());
         std::vector<std::unique_ptr<PersistentIndexSstable>> new_sstables;
@@ -824,8 +820,6 @@ Status LakePersistentIndex::apply_opcompaction(const TxnLogPB_OpCompaction& op_c
                                               opts, _tablet_mgr->sst_location(_tablet_id, sstable_pb.filename())));
             RETURN_IF_ERROR(sstable->init(std::move(rf), sstable_pb, block_cache->cache()));
             new_sstables.push_back(std::move(sstable));
-            LOG(INFO) << "add sst4 : " << sstable_pb.filename();
-            _total_compaction_bytes += sstable_pb.filesize();
         }
         RETURN_IF_ERROR(new_sstable_fileset->init(new_sstables));
     }
@@ -895,8 +889,6 @@ Status LakePersistentIndex::commit(MetaFileBuilder* builder) {
     }
     builder->finalize_sstable_meta(sstable_meta);
     _need_rebuild_file_cnt = need_rebuild_file_cnt(*builder->tablet_meta(), sstable_meta);
-    // print debug info
-    print_debug_info();
     return Status::OK();
 }
 
@@ -1141,25 +1133,6 @@ size_t LakePersistentIndex::memory_usage() const {
         }
     }
     return mem_usage;
-}
-
-void LakePersistentIndex::print_debug_info() const {
-    // print fileset info
-    std::stringstream ss;
-    ss << "LakePersistentIndex debug info: tablet_id=" << _tablet_id
-       << ", memtable_memory_usage=" << (_memtable ? _memtable->memory_usage() : 0)
-       << ", sstable_fileset_cnt=" << _sstable_filesets.size();
-    for (size_t i = 0; i < _sstable_filesets.size(); i++) {
-        ss << "  fileset[" << i << "]: ";
-        _sstable_filesets[i]->print_debug_info(ss);
-    }
-    ss << "  total_compaction_bytes=" << _total_compaction_bytes;
-    ss << "  total_write_bytes=" << _total_write_bytes;
-    ss << "  write amp ratio="
-       << (_total_compaction_bytes == 0 ? 0
-                                        : static_cast<double>(_total_write_bytes + _total_compaction_bytes) /
-                                                  static_cast<double>(_total_write_bytes));
-    LOG(INFO) << ss.str();
 }
 
 } // namespace starrocks::lake
