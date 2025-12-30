@@ -196,7 +196,7 @@ Status PersistentIndexMemtable::flush(WritableFile* wf, uint64_t* filesize, Pers
 Status PersistentIndexMemtable::flush() {
     if (_sstable != nullptr) {
         // already compacted
-        return Status::OK();
+        return Status::AlreadyExist("PersistentIndexMemtable already flushed");
     }
     auto* block_cache = _tablet_mgr->update_mgr()->block_cache();
     if (block_cache == nullptr) {

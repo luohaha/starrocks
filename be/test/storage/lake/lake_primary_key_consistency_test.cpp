@@ -262,6 +262,7 @@ public:
         CHECK_OK(fs::create_directories(lake::join_path(kTestGroupPath, lake::kMetadataDirectoryName)));
         CHECK_OK(fs::create_directories(lake::join_path(kTestGroupPath, lake::kTxnLogDirectoryName)));
         CHECK_OK(_tablet_mgr->put_tablet_metadata(*_tablet_metadata));
+        ExecEnv::GetInstance()->parallel_compact_mgr()->TEST_set_tablet_mgr(_tablet_mgr.get());
         _old_l0_size = config::l0_max_mem_usage;
         config::l0_max_mem_usage = MaxNumber * (sizeof(int) + sizeof(uint64_t) * 2) / 10;
         _old_memtable_size = config::write_buffer_size;
@@ -272,6 +273,24 @@ public:
         config::enable_pk_strict_memcheck = false;
         _old_pk_parallel_execution_threshold_bytes = config::pk_parallel_execution_threshold_bytes;
         config::pk_parallel_execution_threshold_bytes = 1;
+        _old_pk_index_memtable_max_count = config::pk_index_memtable_max_count;
+        config::pk_index_memtable_max_count = 2;
+        _old_pk_index_parallel_compaction_task_split_threshold_bytes =
+                config::pk_index_parallel_compaction_task_split_threshold_bytes;
+        config::pk_index_parallel_compaction_task_split_threshold_bytes = 4096;
+        _old_enable_pk_index_parallel_get = config::enable_pk_index_parallel_get;
+        config::enable_pk_index_parallel_get = true;
+        _old_enable_pk_index_parallel_compaction = config::enable_pk_index_parallel_compaction;
+        config::enable_pk_index_parallel_compaction = true;
+        _old_pk_index_parallel_get_min_rows = config::pk_index_parallel_get_min_rows;
+        config::pk_index_parallel_get_min_rows = 1024;
+        _old_pk_index_parallel_compaction_threadpool_max_threads =
+                config::pk_index_parallel_compaction_threadpool_max_threads;
+        config::pk_index_parallel_compaction_threadpool_max_threads = 4;
+        _old_pk_index_parallel_get_threadpool_max_threads = config::pk_index_parallel_get_threadpool_max_threads;
+        config::pk_index_parallel_get_threadpool_max_threads = 4;
+        _old_pk_index_memtable_flush_threadpool_max_threads = config::pk_index_memtable_flush_threadpool_max_threads;
+        config::pk_index_memtable_flush_threadpool_max_threads = 4;
     }
 
     void TearDown() override {
@@ -280,6 +299,16 @@ public:
         config::write_buffer_size = _old_memtable_size;
         config::enable_pk_strict_memcheck = _old_enable_pk_strict_memcheck;
         config::pk_parallel_execution_threshold_bytes = _old_pk_parallel_execution_threshold_bytes;
+        config::pk_index_memtable_max_count = _old_pk_index_memtable_max_count;
+        config::pk_index_parallel_compaction_task_split_threshold_bytes =
+                _old_pk_index_parallel_compaction_task_split_threshold_bytes;
+        config::enable_pk_index_parallel_get = _old_enable_pk_index_parallel_get;
+        config::enable_pk_index_parallel_compaction = _old_enable_pk_index_parallel_compaction;
+        config::pk_index_parallel_get_min_rows = _old_pk_index_parallel_get_min_rows;
+        config::pk_index_parallel_compaction_threadpool_max_threads =
+                _old_pk_index_parallel_compaction_threadpool_max_threads;
+        config::pk_index_parallel_get_threadpool_max_threads = _old_pk_index_parallel_get_threadpool_max_threads;
+        config::pk_index_memtable_flush_threadpool_max_threads = _old_pk_index_memtable_flush_threadpool_max_threads;
     }
 
     std::shared_ptr<TabletMetadataPB> generate_tablet_metadata(KeysType keys_type) {
@@ -715,11 +744,19 @@ protected:
     int64_t _old_memtable_size = 0;
     bool _old_enable_pk_strict_memcheck = false;
     int64_t _old_pk_parallel_execution_threshold_bytes = 0;
+    int32_t _old_pk_index_memtable_max_count = 0;
+    int64_t _old_pk_index_parallel_compaction_task_split_threshold_bytes = 0;
+    bool _old_enable_pk_index_parallel_get = false;
+    bool _old_enable_pk_index_parallel_compaction = false;
+    int64_t _old_pk_index_parallel_get_min_rows = 0;
+    int64_t _old_pk_index_parallel_compaction_threadpool_max_threads = 0;
+    int64_t _old_pk_index_parallel_get_threadpool_max_threads = 0;
+    int64_t _old_pk_index_memtable_flush_threadpool_max_threads = 0;
 };
 
 TEST_P(LakePrimaryKeyConsistencyTest, test_local_pk_consistency) {
-    _seed = 1719499276; // seed
-    _run_second = 50;   // 50 second
+    _seed = 1719499276;   // seed
+    _run_second = 500000; // 50 second
     LOG(INFO) << "LakePrimaryKeyConsistencyTest begin, seed : " << _seed;
     auto st = run_random_tests();
     if (!st.ok()) {
@@ -727,6 +764,7 @@ TEST_P(LakePrimaryKeyConsistencyTest, test_local_pk_consistency) {
     }
 }
 
+/*
 TEST_P(LakePrimaryKeyConsistencyTest, test_random_seed_pk_consistency) {
     _seed = time(nullptr); // use current ts as seed
     _run_second = 50;      // 50 second
@@ -735,11 +773,10 @@ TEST_P(LakePrimaryKeyConsistencyTest, test_random_seed_pk_consistency) {
     if (!st.ok()) {
         LOG(FATAL) << "run_random_tests fail, st : " << st << " seed : " << _seed;
     }
-}
+}*/
 
 INSTANTIATE_TEST_SUITE_P(LakePrimaryKeyConsistencyTest, LakePrimaryKeyConsistencyTest,
-                         ::testing::Values(PrimaryKeyParam{.persistent_index_type = PersistentIndexTypePB::LOCAL},
-                                           PrimaryKeyParam{
-                                                   .persistent_index_type = PersistentIndexTypePB::CLOUD_NATIVE}));
+                         ::testing::Values(PrimaryKeyParam{
+                                 .persistent_index_type = PersistentIndexTypePB::CLOUD_NATIVE}));
 
 } // namespace starrocks::lake

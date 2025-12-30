@@ -99,6 +99,9 @@ void LakePersistentIndex::set_difference(KeyIndexSet* key_indexes, const KeyInde
 }
 
 bool LakePersistentIndex::is_memtable_full() const {
+    if (_memtable->empty()) {
+        return false;
+    }
     const auto memtable_mem_size = _memtable->memory_usage();
     const bool mem_size_exceed = memtable_mem_size >= config::l0_max_mem_usage;
     // When update memory is urgent, using a lower limit (`l0_min_mem_usage`).
@@ -119,7 +122,7 @@ Status LakePersistentIndex::merge_sstable_into_fileset(std::unique_ptr<Persisten
         need_create_new_fileset = true;
     }
     if (!need_create_new_fileset) {
-        auto st = _sstable_filesets.back()->merge_from(sstable);
+        auto st = _sstable_filesets.back()->append(sstable);
         if (!st.ok()) {
             // create new fileset when merge fail.
             need_create_new_fileset = true;
@@ -131,6 +134,7 @@ Status LakePersistentIndex::merge_sstable_into_fileset(std::unique_ptr<Persisten
         RETURN_IF_ERROR(fileset->init(sstable));
         _sstable_filesets.emplace_back(std::move(fileset));
     }
+    LOG(INFO) << "fileset cnt : " << _sstable_filesets.size() << " new: " << need_create_new_fileset;
     return Status::OK();
 }
 
@@ -182,6 +186,8 @@ Status LakePersistentIndex::sync_flush_all_memtables(int64_t wait_timeout_us) {
             RETURN_IF_ERROR(memtable->flush_status());
             auto sstable = memtable->release_sstable();
             if (sstable != nullptr) {
+                LOG(INFO) << "sstable max rssid " << (sstable != nullptr ? sstable->sstable_pb().max_rss_rowid() : 0)
+                          << " released from memtable, range : " << sstable->sstable_pb().range().ShortDebugString();
                 // try to merge to a existing fileset
                 RETURN_IF_ERROR(merge_sstable_into_fileset(sstable));
                 wait_success = true;
@@ -199,9 +205,12 @@ Status LakePersistentIndex::sync_flush_all_memtables(int64_t wait_timeout_us) {
     if (_memtable && !_memtable->empty()) {
         RETURN_IF_ERROR(_memtable->flush());
         auto sstable = _memtable->release_sstable();
+        LOG(INFO) << "sstable max rssid " << (sstable != nullptr ? sstable->sstable_pb().max_rss_rowid() : 0)
+                  << " released from memtable, range : " << sstable->sstable_pb().range().ShortDebugString();
         DCHECK(sstable != nullptr);
         RETURN_IF_ERROR(merge_sstable_into_fileset(sstable));
-        _memtable = std::make_shared<PersistentIndexMemtable>(_tablet_mgr, _tablet_id, _memtable->max_rss_rowid());
+        const uint64_t next_max_rss_rowid = _memtable->max_rss_rowid();
+        _memtable = std::make_shared<PersistentIndexMemtable>(_tablet_mgr, _tablet_id, next_max_rss_rowid);
     }
     // Reset rebuild file count, avoid useless flush.
     _need_rebuild_file_cnt = 0;
@@ -234,6 +243,8 @@ Status LakePersistentIndex::flush_memtable(bool force) {
             RETURN_IF_ERROR(_inactive_memtables[i]->flush_status());
             auto sstable = _inactive_memtables[i]->release_sstable();
             if (sstable != nullptr) {
+                LOG(INFO) << "sstable max rssid " << (sstable != nullptr ? sstable->sstable_pb().max_rss_rowid() : 0)
+                          << " released from memtable, range : " << sstable->sstable_pb().range().ShortDebugString();
                 // try to merge to a existing fileset
                 RETURN_IF_ERROR(merge_sstable_into_fileset(sstable));
                 finish_point = i;
@@ -249,16 +260,24 @@ Status LakePersistentIndex::flush_memtable(bool force) {
         if (_inactive_memtables.size() + 1 >= config::pk_index_memtable_max_count) {
             // If too many memtables, switch to sync flush.
             RETURN_IF_ERROR(_memtable->flush());
-            auto sstable = _memtable->release_sstable();
-            RETURN_IF_ERROR(merge_sstable_into_fileset(sstable));
+            if (_inactive_memtables.empty()) {
+                // merge directly when no inactive memtable.
+                auto sstable = _memtable->release_sstable();
+                LOG(INFO) << "sstable max rssid " << (sstable != nullptr ? sstable->sstable_pb().max_rss_rowid() : 0)
+                          << " released from memtable, range : " << sstable->sstable_pb().range().ShortDebugString();
+                RETURN_IF_ERROR(merge_sstable_into_fileset(sstable));
+            } else {
+                // move current memtable to inactive memtables
+                _inactive_memtables.push_back(_memtable);
+            }
         } else {
             // submit this memtable to flush thread pool
             RETURN_IF_ERROR(ExecEnv::GetInstance()->pk_index_memtable_flush_thread_pool()->submit(_memtable));
             // move current memtable to inactive memtables
             _inactive_memtables.push_back(_memtable);
         }
-        auto max_rss_rowid = _memtable->max_rss_rowid();
-        _memtable = std::make_shared<PersistentIndexMemtable>(_tablet_mgr, _tablet_id, max_rss_rowid);
+        const uint64_t next_max_rss_rowid = _memtable->max_rss_rowid();
+        _memtable = std::make_shared<PersistentIndexMemtable>(_tablet_mgr, _tablet_id, next_max_rss_rowid);
         // Reset rebuild file count, avoid useless flush.
         _need_rebuild_file_cnt = 0;
     }
@@ -330,6 +349,9 @@ Status LakePersistentIndex::upsert(size_t n, const Slice* keys, const IndexValue
                 for (int i = 0; i < n; ++i) {
                     auto old = old_values[i].get_value();
                     if (old != NullIndexValue) {
+                        if ((uint32_t)(old & ROWID_MASK) == 24943) {
+                            LOG(INFO) << "found del id 24943 in parallel_get, segment id: " << (uint32_t)(old >> 32);
+                        }
                         (*ctx->deletes)[(uint32_t)(old >> 32)].push_back((uint32_t)(old & ROWID_MASK));
                     }
                 }
@@ -551,6 +573,7 @@ StatusOr<AsyncCompactCBPtr> LakePersistentIndex::early_sst_compact(
                                  TxnLogPB txn_log;
                                  for (const auto& candidate : result.candidate_filesets) {
                                      for (const auto& sstable_pb : candidate) {
+                                         LOG(INFO) << "input sstable for early compact: " << sstable_pb.max_rss_rowid();
                                          txn_log.mutable_op_compaction()->add_input_sstables()->CopyFrom(sstable_pb);
                                      }
                                  }
@@ -558,10 +581,9 @@ StatusOr<AsyncCompactCBPtr> LakePersistentIndex::early_sst_compact(
                                          txn_log.op_compaction()
                                                  .input_sstables(txn_log.op_compaction().input_sstables_size() - 1)
                                                  .max_rss_rowid();
-                                 if (result.max_max_rss_rowid != max_rss_rowid) {
-                                     LOG(ERROR) << "early sst compact max_rss_rowid mismatch, expected: "
-                                                << result.max_max_rss_rowid << ", got: " << max_rss_rowid;
-                                 }
+                                 DCHECK(result.max_max_rss_rowid == max_rss_rowid)
+                                         << "Max RSS rowid mismatch. " << result.max_max_rss_rowid << " vs "
+                                         << max_rss_rowid;
                                  for (const auto& sstable_pb : sstables) {
                                      auto* output_sstable = txn_log.mutable_op_compaction()->add_output_sstables();
                                      output_sstable->CopyFrom(sstable_pb);
@@ -597,6 +619,9 @@ Status LakePersistentIndex::parallel_major_compact(lake::LakePersistentIndexPara
     // 4. Record output sstables to txn log.
     uint64_t max_rss_rowid =
             txn_log->op_compaction().input_sstables(txn_log->op_compaction().input_sstables_size() - 1).max_rss_rowid();
+    DCHECK(result.max_max_rss_rowid == max_rss_rowid)
+            << "Max RSS rowid mismatch. " << result.max_max_rss_rowid << " vs " << max_rss_rowid;
+    LOG(INFO) << "sstable max rssid " << max_rss_rowid << " after parallel major compaction for tablet ";
     for (const auto& sstable_pb : output_sstables) {
         auto* output_sstable = txn_log->mutable_op_compaction()->add_output_sstables();
         output_sstable->CopyFrom(sstable_pb);
@@ -701,6 +726,10 @@ Status LakePersistentIndex::apply_opcompaction(const TxnLogPB_OpCompaction& op_c
                                  [&](const std::unique_ptr<PersistentIndexSstableFileset>& fileset) {
                                      return fileset_contains_func(fileset);
                                  });
+    if (start_it == _sstable_filesets.end()) {
+        return Status::InternalError(
+                fmt::format("no matching sstable fileset found for compaction in tablet {}", _tablet_id));
+    }
 
     // 2. Find the end position of the contiguous range.
     // Since the sstable filesets are guaranteed to be contiguous, we just need to find the first one

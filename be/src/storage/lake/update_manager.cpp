@@ -337,7 +337,7 @@ Status UpdateManager::publish_primary_key_tablet(const TxnLogPB_OpWrite& op_writ
             }
         }
         if (async_compact_cb == nullptr && index.current_fileset_index() - current_fileset_start_idx >=
-                                                   config::pk_index_early_sst_compaction_threshold) {
+                                                   config::pk_index_early_sst_compaction_threshold + 1) {
             // Do early sst compaction when too many sst files ingested.
             TRACE_COUNTER_INCREMENT("early_sst_compact_times", 1);
             ASSIGN_OR_RETURN(async_compact_cb,
@@ -415,6 +415,9 @@ Status UpdateManager::publish_primary_key_tablet(const TxnLogPB_OpWrite& op_writ
             total_del += cur_new;
             segment_id_to_add_dels[rssid] += cur_add;
         }
+        LOG(INFO) << strings::Substitute(
+                "[publish_pk_tablet][delvec] tablet:$0 txn:$1 rssid:$2 new_del:$3 total_del:$4", tablet->id(), txn_id,
+                rssid, new_del_vecs[idx].second->cardinality(), total_del);
 
         idx++;
     }

@@ -87,6 +87,9 @@ Status KeyValueMerger::merge(const sstable::Iterator* iter_ptr) {
         if (_index_value_vers.empty()) {
             _max_rss_rowid = max_rss_rowid;
             _index_value_vers.emplace_front(version, index_value);
+            if (index_value.get_rowid() == 24943) {
+                LOG(INFO) << "found del id 24943 in KeyValueMerger merge, segment id: " << index_value.get_rssid();
+            }
         } else if ((version > _index_value_vers.front().first) ||
                    (version == _index_value_vers.front().first && max_rss_rowid > _max_rss_rowid) ||
                    (version == _index_value_vers.front().first && max_rss_rowid == _max_rss_rowid &&
@@ -132,6 +135,9 @@ Status KeyValueMerger::merge(const sstable::Iterator* iter_ptr) {
             _max_rss_rowid = max_rss_rowid;
             std::list<std::pair<int64_t, IndexValue>> t;
             t.emplace_front(version, index_value);
+            if (index_value.get_rowid() == 24943) {
+                LOG(INFO) << "found del id 24943 in KeyValueMerger merge, segment id: " << index_value.get_rssid();
+            }
             _index_value_vers.swap(t);
         }
     } else {
@@ -139,6 +145,9 @@ Status KeyValueMerger::merge(const sstable::Iterator* iter_ptr) {
         _key = key;
         _max_rss_rowid = max_rss_rowid;
         _index_value_vers.emplace_front(version, index_value);
+        if (index_value.get_rowid() == 24943) {
+            LOG(INFO) << "found del id 24943 in KeyValueMerger merge, segment id: " << index_value.get_rssid();
+        }
     }
     return Status::OK();
 }
@@ -158,6 +167,10 @@ Status KeyValueMerger::flush() {
         value->set_version(index_value_with_ver.first);
         value->set_rssid(index_value_with_ver.second.get_rssid());
         value->set_rowid(index_value_with_ver.second.get_rowid());
+        if (index_value_with_ver.second.get_rowid() == 24943) {
+            LOG(INFO) << "found del id 24943 in KeyValueMerger flush, segment id: "
+                      << index_value_with_ver.second.get_rssid();
+        }
     }
     if (index_value_pb.values_size() > 0) {
         if (_output_builders.empty() ||

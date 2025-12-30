@@ -262,7 +262,9 @@ protected:
     }
 
 public:
-    uint32_t use_count() const { return _use_count.load(); }
+    uint32_t use_count() const {
+        return _use_count.load();
+    }
 
     template <typename... Args>
     static MutablePtr create(Args&&... args) {
@@ -274,8 +276,12 @@ public:
         return create(std::forward<std::initializer_list<T>>(arg));
     }
 
-    Ptr get_ptr() const { return Ptr(derived()); }
-    MutablePtr get_ptr() { return MutablePtr(derived()); }
+    Ptr get_ptr() const {
+        return Ptr(derived());
+    }
+    MutablePtr get_ptr() {
+        return MutablePtr(derived());
+    }
 
     // cast the data as mutable ptr if it's mutable no matter it's mutable or immutable.
     // NOTE:  ptr's use_count will be added by 1, and this is not safe because the data may be shared with others.
@@ -284,8 +290,8 @@ public:
 #ifndef NDEBUG
         uint32_t ref_count = use_count();
         if (ref_count > 2) {
-            DLOG(INFO) << "[Cow] as_mutable_ptr() called on heavily shared object (use_count=" << ref_count
-                       << "). This may be unsafe! Consider using try_mutate() for proper COW semantics.";
+            //DLOG(INFO) << "[Cow] as_mutable_ptr() called on heavily shared object (use_count=" << ref_count
+            //           << "). This may be unsafe! Consider using try_mutate() for proper COW semantics.";
         }
 #endif
         return const_cast<Cow*>(this)->get_ptr();
@@ -309,7 +315,9 @@ public:
     }
 
     // Get mutable reference without reference counting overhead.
-    Derived& as_mutable_ref() const { return *as_mutable_raw_ptr(); }
+    Derived& as_mutable_ref() const {
+        return *as_mutable_raw_ptr();
+    }
 
 private:
     using AtomicCounter = std::atomic<uint32_t>;

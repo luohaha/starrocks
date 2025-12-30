@@ -31,6 +31,7 @@ void DelVector::set_empty() {
     _cardinality = 0;
     _memory_usage = 0;
     _roaring.reset();
+    _debug_del_set.clear();
 }
 
 void DelVector::_add_dels(const std::vector<uint32_t>& dels) {
@@ -40,6 +41,12 @@ void DelVector::_add_dels(const std::vector<uint32_t>& dels) {
         _roaring->addMany(dels.size(), dels.data());
     }
     _update_stats();
+    for (auto del_id : dels) {
+        auto r = _debug_del_set.insert(del_id);
+        if (!r.second) {
+            LOG(WARNING) << "duplicate del id inserted into delvec: " << del_id;
+        }
+    }
 }
 
 void DelVector::add_dels_as_new_version(const std::vector<uint32_t>& dels, int64_t version,
@@ -48,6 +55,7 @@ void DelVector::add_dels_as_new_version(const std::vector<uint32_t>& dels, int64
     DelVectorPtr tmp(new DelVector());
     if (_roaring) {
         tmp->_roaring = std::make_unique<Roaring>(*_roaring);
+        tmp->_debug_del_set = _debug_del_set;
     }
     tmp->_version = version;
     tmp->_loaded = true;
@@ -70,6 +78,16 @@ Status DelVector::load(int64_t version, const char* data, size_t length) {
         _roaring = std::make_unique<Roaring>(Roaring::readSafe(data, length));
     }
     _update_stats();
+    if (_cardinality > 0) {
+        std::vector<uint32_t> result(_cardinality);
+        _roaring->toUint32Array(result.data());
+        for (size_t i = 0; i < _cardinality; ++i) {
+            auto r = _debug_del_set.insert(result[i]);
+            if (!r.second) {
+                LOG(WARNING) << "duplicate del id inserted into delvec: " << result[i];
+            }
+        }
+    }
     return Status::OK();
 }
 
@@ -80,6 +98,12 @@ void DelVector::init(int64_t version, const uint32_t* data, size_t length) {
         _roaring = std::make_unique<Roaring>(length, data);
     }
     _update_stats();
+    for (size_t i = 0; i < length; ++i) {
+        auto r = _debug_del_set.insert(data[i]);
+        if (!r.second) {
+            LOG(WARNING) << "duplicate del id inserted into delvec: " << data[i];
+        }
+    }
 }
 
 string DelVector::save() const {
@@ -130,6 +154,7 @@ void DelVector::copy_from(const DelVector& delvec) {
     } else {
         _roaring.reset();
     }
+    _debug_del_set = delvec._debug_del_set;
 }
 
 } // namespace starrocks

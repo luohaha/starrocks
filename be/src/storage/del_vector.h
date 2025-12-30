@@ -73,6 +73,7 @@ private:
     size_t _cardinality = 0;
     size_t _memory_usage = 0;
     std::unique_ptr<Roaring> _roaring;
+    std::unordered_set<uint32_t> _debug_del_set;
 };
 
 typedef std::shared_ptr<DelVector> DelVectorPtr;

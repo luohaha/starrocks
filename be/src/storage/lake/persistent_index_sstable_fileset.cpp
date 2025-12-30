@@ -22,9 +22,7 @@
 namespace starrocks::lake {
 
 Status PersistentIndexSstableFileset::init(std::vector<std::unique_ptr<PersistentIndexSstable>>& sstables) {
-    if (is_inited()) {
-        return Status::InternalError("sstable fileset is already initialized");
-    }
+    RETURN_IF(is_inited(), Status::InternalError("sstable fileset is already initialized"));
     const sstable::Comparator* comparator = sstable::BytewiseComparator();
     for (auto&& sstable : sstables) {
         if (sstable->sstable_pb().has_range()) {
@@ -57,9 +55,7 @@ Status PersistentIndexSstableFileset::init(std::vector<std::unique_ptr<Persisten
 }
 
 Status PersistentIndexSstableFileset::init(std::unique_ptr<PersistentIndexSstable>& sstable) {
-    if (is_inited()) {
-        return Status::InternalError("sstable fileset is already initialized");
-    }
+    RETURN_IF(is_inited(), Status::InternalError("sstable fileset is already initialized"));
     if (sstable->sstable_pb().has_range()) {
         if (!sstable->sstable_pb().has_fileset_id()) {
             // New fileset
@@ -80,7 +76,7 @@ Status PersistentIndexSstableFileset::init(std::unique_ptr<PersistentIndexSstabl
     return Status::OK();
 }
 
-Status PersistentIndexSstableFileset::merge_from(std::unique_ptr<PersistentIndexSstable>& sstable) {
+Status PersistentIndexSstableFileset::append(std::unique_ptr<PersistentIndexSstable>& sstable) {
     const sstable::Comparator* comparator = sstable::BytewiseComparator();
     DCHECK(sstable->sstable_pb().has_range());
     // Make sure sstable is inorder via comparator
@@ -90,7 +86,8 @@ Status PersistentIndexSstableFileset::merge_from(std::unique_ptr<PersistentIndex
             return Status::InternalError("sstables are not in order or have overlap key range");
         }
     } else {
-        return Status::InternalError("sstable fileset is not init yet");
+        DCHECK(_standalone_sstable != nullptr);
+        return Status::InternalError("sstable fileset is standalone sstable");
     }
     // Extract keys before moving sstable to avoid undefined behavior
     std::string start_key = sstable->sstable_pb().range().start_key();
