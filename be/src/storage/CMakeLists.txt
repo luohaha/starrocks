@@ -39,6 +39,7 @@ set(STORAGE_FILES
     olap_define.cpp
     olap_server.cpp
     options.cpp
+    persistent_index_internal.cpp
     persistent_index.cpp
     primary_index.cpp
     primary_key_encoder.cpp
