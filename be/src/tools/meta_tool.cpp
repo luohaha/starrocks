@@ -75,15 +75,12 @@
 #include "storage/rowset/column_reader.h"
 #include "storage/rowset/segment.h"
 #include "storage/rowset/segment_options.h"
-<<<<<<< HEAD
-=======
 #include "storage/rowset/zone_map_index.h"
 #include "storage/sstable/block.h"
 #include "storage/sstable/comparator.h"
 #include "storage/sstable/format.h"
 #include "storage/sstable/options.h"
 #include "storage/sstable/table.h"
->>>>>>> 9b08a94db2 ([Tool] Add dump_lake_persistent_index_sst operation to meta_tool (#69682))
 #include "storage/tablet_meta.h"
 #include "storage/tablet_meta_manager.h"
 #include "storage/tablet_schema_map.h"
@@ -115,12 +112,9 @@ DEFINE_string(root_path, "", "storage root path");
 DEFINE_string(operation, "",
               "valid operation: get_meta, flag, load_meta, delete_meta, delete_rowset_meta, get_persistent_index_meta, "
               "delete_persistent_index_meta, show_meta, check_table_meta_consistency, print_lake_metadata, "
-<<<<<<< HEAD
               "print_lake_txn_log, print_lake_schema");
-=======
               "print_lake_bundle_metadata, print_lake_txn_log, print_lake_schema, dump_zonemap, "
               "dump_lake_persistent_index_sst");
->>>>>>> 9b08a94db2 ([Tool] Add dump_lake_persistent_index_sst operation to meta_tool (#69682))
 DEFINE_int64(tablet_id, 0, "tablet_id for tablet meta");
 DEFINE_string(tablet_uid, "", "tablet_uid for tablet meta");
 DEFINE_int64(table_id, 0, "table id for table meta");
@@ -136,15 +130,12 @@ DEFINE_int64(expired_sec, 86400, "expired seconds");
 DEFINE_string(conf_file, "", "conf file path");
 DEFINE_string(audit_file, "", "audit file path");
 DEFINE_bool(do_delete, false, "do delete files");
-<<<<<<< HEAD
-=======
 DEFINE_uint64(page_offset, -1, "page offset");
 DEFINE_uint32(page_size, -1, "page size");
 DEFINE_string(encryption_meta, "",
               "hex-encoded encryption_meta from PersistentIndexSstablePB (for dump_lake_persistent_index_sst)");
 DEFINE_string(fe_host, "", "FE master hostname for TDE key refresh (for dump_lake_persistent_index_sst)");
 DEFINE_int32(fe_port, 9020, "FE master thrift port for TDE key refresh (for dump_lake_persistent_index_sst)");
->>>>>>> 9b08a94db2 ([Tool] Add dump_lake_persistent_index_sst operation to meta_tool (#69682))
 
 // flag defined in gflags library
 DECLARE_bool(helpshort);
@@ -1387,8 +1378,6 @@ int meta_tool_main(int argc, char** argv) {
             std::cout << "dump segment data failed: " << st.message() << std::endl;
             return -1;
         }
-<<<<<<< HEAD
-=======
     } else if (FLAGS_operation == "dump_zonemap") {
         if (FLAGS_file == "") {
             std::cout << "no file flag for dump zonemap" << std::endl;
@@ -1455,7 +1444,6 @@ int meta_tool_main(int argc, char** argv) {
             enc_info = std::move(enc_info_res).value();
         }
         dump_lake_persistent_index_sst(FLAGS_file, enc_info);
->>>>>>> 9b08a94db2 ([Tool] Add dump_lake_persistent_index_sst operation to meta_tool (#69682))
     } else if (FLAGS_operation == "print_lake_metadata") {
         starrocks::TabletMetadataPB metadata;
         if (!metadata.ParseFromIstream(&std::cin)) {
