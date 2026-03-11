@@ -93,8 +93,12 @@ int64_t cal_new_base_version(int64_t tablet_id, TabletManager* tablet_mgr, int64
     if (index_version > version) {
         // There is a possibility that the index version is newer than the version in remote storage.
         // Check whether the index version exists in remote storage. If not, clear and rebuild the index.
-        auto res = tablet_mgr->get_tablet_metadata(tablet_id, index_version, true,
-                                                   txns[index_version - base_version - 1].gtid());
+        int64_t gtid = 0;
+        auto txn_idx = index_version - base_version - 1;
+        if (txn_idx >= 0 && static_cast<size_t>(txn_idx) < txns.size()) {
+            gtid = txns[txn_idx].gtid();
+        }
+        auto res = tablet_mgr->get_tablet_metadata(tablet_id, index_version, true, gtid);
         if (res.ok()) {
             version = index_version;
         } else {
