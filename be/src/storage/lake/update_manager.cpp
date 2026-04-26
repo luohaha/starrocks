@@ -14,6 +14,10 @@
 
 #include "storage/lake/update_manager.h"
 
+#include <atomic>
+#include <thread>
+#include <vector>
+
 #include "base/container/lru_cache.h"
 #include "base/debug/trace.h"
 #include "base/failpoint/fail_point.h"
@@ -34,6 +38,7 @@
 #include "storage/lake/column_mode_partial_update_handler.h"
 #include "storage/lake/lake_local_persistent_index.h"
 #include "storage/lake/lake_persistent_index.h"
+#include "storage/lake/lake_persistent_index_snapshot.h"
 #include "storage/lake/lake_primary_key_compaction_conflict_resolver.h"
 #include "storage/lake/local_pk_index_manager.h"
 #include "storage/lake/location_provider.h"
@@ -86,9 +91,229 @@ UpdateManager::UpdateManager(std::shared_ptr<LocationProvider> location_provider
 }
 
 UpdateManager::~UpdateManager() {
+    // Best-effort fallback. pre_shutdown_hook() called from the BE shutdown
+    // sequence is the load-bearing capture path; this destructor copy only
+    // fires if the process actually reaches storage-engine teardown without
+    // aborting earlier (e.g. on threadpool destruction with allocated tokens).
+    // Guarded by _pre_shutdown_capture_done so the cache is not walked twice.
+    if (config::enable_pk_index_snapshot_persistence && config::pk_index_snapshot_capture_on_shutdown &&
+        !_pre_shutdown_capture_done.load(std::memory_order_relaxed)) {
+        _capture_index_cache_snapshots("shutdown-dtor");
+        _capture_evicted_tablet_snapshots("shutdown-dtor-evicted");
+    }
     _index_cache.clear();
     _update_state_cache.clear();
     _compaction_cache.clear();
+}
+
+void UpdateManager::pre_shutdown_hook() {
+    if (!config::enable_pk_index_snapshot_persistence || !config::pk_index_snapshot_capture_on_shutdown) {
+        return;
+    }
+    if (_pre_shutdown_capture_done.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+    _capture_index_cache_snapshots("pre-shutdown");
+    // The in-cache walk only covers tablets currently resident in `_index_cache`.
+    // Workloads where the active tablet set exceeds cache capacity (TTL or
+    // memory-pressure evictions before shutdown) leave a long tail of "evicted
+    // but recently loaded" tablets uncaptured, which then incur a full cold
+    // rebuild on the next BE start. The stub-snapshot walk closes that gap.
+    _capture_evicted_tablet_snapshots("pre-shutdown-evicted");
+}
+
+namespace {
+
+struct PrewarmTarget {
+    int64_t tablet_id = 0;
+    int64_t version = 0;
+};
+
+} // namespace
+
+void UpdateManager::boot_prewarm_hook() {
+    if (!config::enable_pk_index_snapshot_persistence || !config::enable_pk_index_snapshot_prewarm_on_boot) {
+        return;
+    }
+    if (_tablet_mgr == nullptr) {
+        return;
+    }
+    const int32_t worker_threads = config::pk_index_snapshot_prewarm_threads;
+    if (worker_threads <= 0) {
+        return;
+    }
+
+    std::string snapshot_root;
+    Status root_st = get_lake_persistent_index_snapshot_root(&snapshot_root);
+    if (!root_st.ok()) {
+        LOG(INFO) << "pk-index snapshot prewarm: no snapshot root derivable: " << root_st.to_string();
+        return;
+    }
+    if (!fs::path_exist(snapshot_root)) {
+        LOG(INFO) << "pk-index snapshot prewarm: snapshot root " << snapshot_root << " does not exist; nothing to do";
+        return;
+    }
+    auto fs_or = FileSystemFactory::CreateSharedFromString(snapshot_root);
+    if (!fs_or.ok()) {
+        LOG(WARNING) << "pk-index snapshot prewarm: cannot open snapshot root " << snapshot_root << ": "
+                     << fs_or.status().to_string();
+        return;
+    }
+    auto fs = fs_or.value();
+
+    // Walk top-level entries: each is a per-tablet directory `<tablet_id>/`.
+    std::vector<std::string> tablet_dirs;
+    Status iter_st = fs->iterate_dir(snapshot_root, [&](std::string_view name) -> bool {
+        if (name == "." || name == "..") return true;
+        tablet_dirs.emplace_back(name);
+        return true;
+    });
+    if (!iter_st.ok()) {
+        LOG(WARNING) << "pk-index snapshot prewarm: iterate_dir failed for " << snapshot_root << ": "
+                     << iter_st.to_string();
+        return;
+    }
+
+    // For each tablet dir, find the highest-versioned snapshot file.
+    std::vector<PrewarmTarget> targets;
+    targets.reserve(tablet_dirs.size());
+    for (const auto& dir_name : tablet_dirs) {
+        // The directory name must be a positive int — skip anything else (best-effort: someone
+        // dropped a stray file in the snapshot root).
+        int64_t tablet_id = 0;
+        if (dir_name.empty()) continue;
+        bool numeric = true;
+        for (char c : dir_name) {
+            if (c < '0' || c > '9') {
+                numeric = false;
+                break;
+            }
+            tablet_id = tablet_id * 10 + (c - '0');
+        }
+        if (!numeric || tablet_id <= 0) continue;
+
+        const std::string tablet_dir = snapshot_root + dir_name;
+        int64_t best_version = -1;
+        Status per_tablet_iter = fs->iterate_dir(tablet_dir, [&](std::string_view name) -> bool {
+            if (name == "." || name == "..") return true;
+            const int64_t v = parse_snapshot_version_from_filename(name);
+            if (v > best_version) {
+                best_version = v;
+            }
+            return true;
+        });
+        if (!per_tablet_iter.ok()) {
+            // Per-tablet iteration failure is best-effort; continue with the next tablet.
+            VLOG(1) << "pk-index snapshot prewarm: iterate_dir failed for " << tablet_dir << ": "
+                    << per_tablet_iter.to_string();
+            continue;
+        }
+        if (best_version < 0) continue;
+        targets.push_back({tablet_id, best_version});
+    }
+
+    if (targets.empty()) {
+        LOG(INFO) << "pk-index snapshot prewarm: snapshot root " << snapshot_root
+                  << " has no usable snapshot files; nothing to pre-warm";
+        return;
+    }
+
+    // Run the per-tablet pre-warm on a detached background thread that fans out to
+    // `worker_threads` worker threads. Boot does not block on completion: the BE is
+    // ready to accept requests immediately, and any tablet whose snapshot has not yet
+    // been restored will hit the existing lazy-restore-on-publish path on first use.
+    LOG(INFO) << "pk-index snapshot prewarm: dispatching " << targets.size() << " tablet(s) across " << worker_threads
+              << " worker thread(s) from " << snapshot_root;
+
+    auto walker = [this, targets = std::move(targets), worker_threads, snapshot_root]() mutable {
+        std::atomic<size_t> next{0};
+        std::atomic<int64_t> ok{0};
+        std::atomic<int64_t> miss{0};
+        std::atomic<int64_t> failed{0};
+
+        auto worker_fn = [&]() {
+            while (true) {
+                const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                if (i >= targets.size()) {
+                    return;
+                }
+                const auto& t = targets[i];
+
+                auto metadata_or = _tablet_mgr->get_tablet_metadata(t.tablet_id, t.version, /*fill_cache=*/false);
+                if (!metadata_or.ok()) {
+                    // Most common reason here is that the FE has advanced this tablet's metadata
+                    // beyond the snapshot's captured_version, so the exact-version object no
+                    // longer exists. Fall back to lazy-restore on the next publish.
+                    miss.fetch_add(1, std::memory_order_relaxed);
+                    VLOG(1) << "pk-index snapshot prewarm: get_tablet_metadata failed tablet=" << t.tablet_id
+                            << " version=" << t.version << ": " << metadata_or.status().to_string();
+                    continue;
+                }
+                auto metadata = std::move(metadata_or).value();
+
+                // The publish path uses the same `get_or_create` lookup; pre-warm reuses it so
+                // the eventual publish lookup finds our entry.
+                auto* index_entry = _index_cache.get_or_create(metadata->id());
+                index_entry->update_expire_time(MonotonicMillis() + get_cache_expire_ms());
+                auto& index = index_entry->value();
+                Status restore_st = index.try_lake_load_from_snapshot(_tablet_mgr, metadata, t.version);
+                if (!restore_st.ok()) {
+                    // Pre-warm did not populate this entry; remove it so the publish path
+                    // creates a fresh one and runs the cold rebuild without any partial state.
+                    if (restore_st.is_not_found()) {
+                        miss.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        failed.fetch_add(1, std::memory_order_relaxed);
+                        LOG(WARNING) << "pk-index snapshot prewarm: try_lake_load_from_snapshot failed tablet="
+                                     << t.tablet_id << " version=" << t.version << ": " << restore_st.to_string();
+                    }
+                    _index_cache.remove(index_entry);
+                    continue;
+                }
+                _index_cache.update_object_size(index_entry, index.memory_usage());
+                // Track the metadata so a stub snapshot can still be captured at shutdown if
+                // this entry is later evicted before any publish ever loads it. Mirrors the
+                // call inside `prepare_primary_index`.
+                note_pk_tablet_metadata(metadata->id(), metadata);
+                _index_cache.release(index_entry);
+                ok.fetch_add(1, std::memory_order_relaxed);
+            }
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(worker_threads);
+        for (int32_t w = 0; w < worker_threads; w++) {
+            workers.emplace_back(worker_fn);
+        }
+        for (auto& w : workers) {
+            w.join();
+        }
+
+        LOG(INFO) << "pk-index snapshot prewarm: complete root=" << snapshot_root << " walked=" << targets.size()
+                  << " ok=" << ok.load(std::memory_order_relaxed) << " miss=" << miss.load(std::memory_order_relaxed)
+                  << " failed=" << failed.load(std::memory_order_relaxed);
+    };
+
+    std::thread(std::move(walker)).detach();
+}
+
+void UpdateManager::note_pk_tablet_metadata(int64_t tablet_id, const TabletMetadataPtr& metadata) {
+    if (!config::enable_pk_index_snapshot_persistence) {
+        return;
+    }
+    if (metadata == nullptr) {
+        return;
+    }
+    // Only worth tracking PK tablets — non-PK tablets never have an `_index_cache`
+    // entry to evict, so they cannot benefit from a snapshot. Skip the LOCAL
+    // persistent-index variant too: snapshot persistence is wired only for the
+    // CLOUD_NATIVE path (`LakePersistentIndex`).
+    if (!metadata->enable_persistent_index() ||
+        metadata->persistent_index_type() != PersistentIndexTypePB::CLOUD_NATIVE) {
+        return;
+    }
+    std::lock_guard<std::mutex> lg(_last_seen_pk_metadata_mu);
+    _last_seen_pk_metadata[tablet_id] = metadata;
 }
 
 UpdateManager::PkIndexShard& UpdateManager::_get_pk_index_shard(int64_t tabletId) {
@@ -199,6 +424,11 @@ StatusOr<IndexEntry*> UpdateManager::prepare_primary_index(
         LOG(ERROR) << msg;
         return Status::InternalError(msg);
     }
+    // Track the latest metadata for this tablet so a stub snapshot can still be
+    // captured at shutdown if the entry is later evicted from `_index_cache`.
+    // Done after `prepare()` succeeds — the entry is now in a state we'd be
+    // willing to restore from on a future cold load.
+    note_pk_tablet_metadata(metadata->id(), metadata);
     return index_entry;
 }
 
@@ -1502,6 +1732,13 @@ void UpdateManager::expire_cache() {
 
         ssize_t index_orig_size = _index_cache.size();
         ssize_t index_orig_obj_size = _index_cache.object_size();
+        if (config::enable_pk_index_snapshot_persistence && config::pk_index_snapshot_capture_on_eviction) {
+            // Snapshot before clear_expired so the entries that are about to be dropped by
+            // TTL leave a local copy behind for the next cold load. Pre-walk via
+            // get_all_entries holds an extra ref on each entry; release returns them to
+            // ref==1 so clear_expired can then reap the ones whose expire_ms has passed.
+            _capture_index_cache_snapshots("ttl-eviction");
+        }
         _index_cache.clear_expired();
         ssize_t index_size = _index_cache.size();
         ssize_t index_obj_size = _index_cache.object_size();
@@ -1531,6 +1768,9 @@ void UpdateManager::evict_cache(int64_t memory_urgent_level, int64_t memory_high
     int64_t memory_high = capacity * memory_high_level / 100;
 
     if (size > memory_urgent) {
+        if (config::enable_pk_index_snapshot_persistence && config::pk_index_snapshot_capture_on_eviction) {
+            _capture_index_cache_snapshots("memory-pressure-eviction");
+        }
         _index_cache.try_evict(memory_urgent);
     }
 
@@ -1540,6 +1780,158 @@ void UpdateManager::evict_cache(int64_t memory_urgent_level, int64_t memory_high
         _index_cache.try_evict(target_memory);
     }
     return;
+}
+
+void UpdateManager::_capture_index_cache_snapshots(const char* reason) {
+    auto entries = _index_cache.get_all_entries();
+    int64_t ok_count = 0;
+    int64_t skipped_count = 0;
+    int64_t failed_count = 0;
+    for (auto* entry : entries) {
+        Status st = entry->value().try_snapshot_to_local(_tablet_mgr);
+        if (st.ok()) {
+            ok_count++;
+        } else if (st.is_not_found() || st.is_invalid_argument()) {
+            // Expected misses (snapshot disabled, no metadata at this version, no usable
+            // root). Counted separately so an eviction storm does not flood WARNING with
+            // benign messages.
+            skipped_count++;
+        } else {
+            failed_count++;
+            LOG_EVERY_N(WARNING, 100) << "pk-index snapshot capture (" << reason
+                                      << ") failed for tablet=" << entry->key() << ": " << st.to_string();
+        }
+        _index_cache.release(entry);
+    }
+    if (!entries.empty()) {
+        // Promoted from VLOG(2) to LOG(INFO): without an unconditional log line
+        // there is no way for an operator to confirm the capture path actually
+        // ran during BE shutdown, which made this 4-PR series unobservable in
+        // production for several iterations. Log volume is bounded by the
+        // number of capture sites (`shutdown`, `pre-shutdown`, `ttl-eviction`,
+        // `memory-pressure-eviction`) and by the cache size.
+        LOG(INFO) << "pk-index snapshot capture (" << reason << ") walked=" << entries.size() << " ok=" << ok_count
+                  << " skipped=" << skipped_count << " failed=" << failed_count;
+    }
+}
+
+void UpdateManager::_capture_evicted_tablet_snapshots(const char* reason) {
+    // Snapshot a copy of the (tablet_id -> metadata) tracking map under the
+    // mutex, then iterate without holding the lock — `write_stub_lake_persistent_index_snapshot`
+    // does a local file write that we don't want serialized behind future
+    // `note_pk_tablet_metadata` callers (which run on the publish hot path).
+    std::unordered_map<int64_t, TabletMetadataPtr> tracked;
+    {
+        std::lock_guard<std::mutex> lg(_last_seen_pk_metadata_mu);
+        tracked = _last_seen_pk_metadata;
+    }
+    int64_t walked = 0;
+    int64_t ok_count = 0;
+    int64_t skipped_count = 0;
+    int64_t failed_count = 0;
+    for (const auto& kv : tracked) {
+        const int64_t tablet_id = kv.first;
+        const TabletMetadataPtr& metadata = kv.second;
+        // Skip tablets currently in `_index_cache` — the in-cache walk above
+        // already wrote a full memtable-bearing snapshot for them. Writing a
+        // stub on top would clobber the richer capture.
+        auto* in_cache = _index_cache.get(tablet_id);
+        if (in_cache != nullptr) {
+            _index_cache.release(in_cache);
+            continue;
+        }
+        walked++;
+        if (metadata == nullptr) {
+            skipped_count++;
+            continue;
+        }
+        if (metadata->sstable_meta().sstables_size() == 0) {
+            // No SSTs to reference. A stub snapshot would be vacuous — the
+            // restore-side pre-flight skips it because there's nothing to
+            // validate against.
+            skipped_count++;
+            continue;
+        }
+        // Critical correctness gate: only stub-snapshot tablets where the SSTs
+        // already cover all rowsets (no pending merge work). If we wrote a stub
+        // for a tablet with unmerged rowsets, the restore-side empty-memtable
+        // would silently elide those rowsets — losing data. The same predicate
+        // is what `LakePersistentIndex::load_from_lake_tablet` uses to decide
+        // whether to skip the rebuild loop.
+        auto rebuild_counts = LakePersistentIndex::need_rebuild_counts(*metadata, metadata->sstable_meta());
+        if (rebuild_counts.first > 0 || rebuild_counts.second > 0) {
+            skipped_count++;
+            continue;
+        }
+        // Don't clobber a richer (full memtable) snapshot already written by
+        // the in-cache walk for the same (tablet_id, version) pair, e.g. if the
+        // entry was in cache during `_capture_index_cache_snapshots` and got
+        // evicted before this walk reached it. The stub would overwrite the
+        // full one at the same path. Cheapest defence: pre-check existence.
+        std::string expected_path;
+        if (get_lake_persistent_index_snapshot_path(tablet_id, static_cast<int64_t>(metadata->version()),
+                                                    &expected_path)
+                    .ok() &&
+            fs::path_exist(expected_path)) {
+            skipped_count++;
+            continue;
+        }
+        Status st = write_stub_lake_persistent_index_snapshot(tablet_id, *metadata);
+        if (st.ok()) {
+            ok_count++;
+        } else if (st.is_not_found() || st.is_invalid_argument()) {
+            // Expected misses (snapshot directory derivation failed, etc.)
+            // — counted separately so a real IO failure stands out.
+            skipped_count++;
+        } else {
+            failed_count++;
+            LOG_EVERY_N(WARNING, 100) << "pk-index stub-snapshot capture (" << reason
+                                      << ") failed for tablet=" << tablet_id << ": " << st.to_string();
+        }
+    }
+    if (walked > 0) {
+        // Promoted to LOG(INFO) for the same operator-visibility reason as
+        // `_capture_index_cache_snapshots`: a silent no-op walk has no way to
+        // confirm the new shutdown coverage actually fires in production.
+        LOG(INFO) << "pk-index stub-snapshot capture (" << reason << ") walked=" << walked << " ok=" << ok_count
+                  << " skipped=" << skipped_count << " failed=" << failed_count;
+    }
+}
+
+void UpdateManager::gc_stale_pk_index_snapshots() {
+    if (!config::enable_pk_index_snapshot_persistence) {
+        return;
+    }
+    const int64_t max_age = config::pk_index_snapshot_max_age_sec;
+    if (max_age <= 0) {
+        return;
+    }
+    const int64_t interval_sec = config::pk_index_snapshot_gc_interval_sec;
+    if (interval_sec <= 0) {
+        return;
+    }
+    const int64_t now_millis = MonotonicMillis();
+    const int64_t last = _last_pk_snapshot_gc_millis.load(std::memory_order_relaxed);
+    if (last != 0 && now_millis - last < interval_sec * 1000) {
+        return;
+    }
+    _last_pk_snapshot_gc_millis.store(now_millis, std::memory_order_relaxed);
+
+    std::string root;
+    Status root_st = get_lake_persistent_index_snapshot_root(&root);
+    if (!root_st.ok()) {
+        VLOG(2) << "pk-index snapshot GC skipped: " << root_st.to_string();
+        return;
+    }
+    int64_t removed = 0;
+    Status gc_st = gc_stale_lake_persistent_index_snapshots(root, max_age, &removed);
+    if (!gc_st.ok()) {
+        LOG(WARNING) << "pk-index snapshot GC failed under " << root << ": " << gc_st.to_string();
+        return;
+    }
+    if (removed > 0) {
+        LOG(INFO) << "pk-index snapshot GC removed " << removed << " stale files under " << root;
+    }
 }
 
 size_t UpdateManager::get_rowset_num_deletes(int64_t tablet_id, int64_t version, const RowsetMetadataPB& rowset_meta) {

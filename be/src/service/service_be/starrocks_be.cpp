@@ -45,6 +45,7 @@
 #ifndef __APPLE__
 #include "service/service_be/lake_service.h"
 #include "storage/lake/tablet_manager.h"
+#include "storage/lake/update_manager.h"
 #endif
 #include "cache/datacache_metrics.h"
 #include "common/system/mem_info.h"
@@ -154,6 +155,24 @@ void start_be(const std::vector<StorePath>& paths, bool as_cn) {
 #ifndef __APPLE__
     // Register datacache metrics
     register_datacache_metrics(use_same_datacache_instance);
+
+    // Symmetric counterpart to pre_shutdown_hook: kick off boot-time pre-warm of the PK-index
+    // cache from on-disk snapshot files. The hook fans out to a detached worker pool that
+    // calls `TabletManager::get_tablet_metadata()` for each tablet — which routes through
+    // `StarletLocationProvider::real_location()` → `StarOSWorker::retrieve_shard_info()`.
+    // That dependency means the hook MUST be dispatched AFTER `init_staros_worker(...)` has
+    // run; firing it earlier (right after `start_bg_threads()`) raced the worker init and
+    // SIGSEGV'd in `retrieve_shard_info` on cold boot in iter-042.
+    // The hook returns immediately after dispatching to a background thread pool, so the
+    // BRPC / HTTP servers below come up at their normal time and any tablet not yet
+    // pre-warmed falls back to the lazy-restore-on-publish path on first access. No-op when
+    // snapshot persistence or pre-warm is disabled.
+    if (auto* lake_tablet_mgr = exec_env->lake_tablet_manager()) {
+        if (auto* update_mgr = lake_tablet_mgr->update_mgr()) {
+            update_mgr->boot_prewarm_hook();
+        }
+    }
+    LOG(INFO) << process_name << " start step " << start_step++ << ": pk-index snapshot prewarm dispatched";
 #endif
 
     // set up thrift client before providing any service to the external
@@ -298,6 +317,22 @@ void start_be(const std::vector<StorePath>& paths, bool as_cn) {
 
     exec_env->wait_for_finish();
     LOG(INFO) << process_name << " exit step " << exit_step++ << ": wait exec engine tasks finish successfully";
+
+#ifdef USE_STAROS
+    // Capture cached PK indexes BEFORE further teardown stages so the snapshot
+    // path runs while threadpools, tablet manager and storage engine are still
+    // alive. The destructor-based hook in `~UpdateManager` is unreachable in
+    // practice — earlier stages (e.g. cloud_native_pk_index_compact threadpool
+    // destruction with allocated tokens) abort the process before any
+    // destructor would run, so a "shutdown" capture from the destructor never
+    // produces files. This is the first opportunity that survives.
+    if (auto* lake_tablet_mgr = exec_env->lake_tablet_manager()) {
+        if (auto* update_mgr = lake_tablet_mgr->update_mgr()) {
+            update_mgr->pre_shutdown_hook();
+        }
+    }
+    LOG(INFO) << process_name << " exit step " << exit_step++ << ": pk-index snapshot capture complete";
+#endif
 
     heartbeat_server->stop();
     heartbeat_server->join();

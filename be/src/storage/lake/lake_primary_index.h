@@ -126,6 +126,31 @@ public:
     int32_t publish_sst_flush_count() const;
     int64_t publish_sst_flush_bytes() const;
 
+    // Best-effort snapshot of the underlying cloud-native PK index to local disk so
+    // that a future cold-load can skip the rowset-scan + load_dels stage. Returns
+    // OK on success (or when there is nothing to do — disabled, non-cloud-native,
+    // index in active use), and a non-OK status only on serialisation / IO errors.
+    // The caller (UpdateManager pre-eviction / shutdown walk) treats per-entry
+    // failures as best-effort and continues.
+    Status try_snapshot_to_local(TabletManager* tablet_mgr);
+
+    // Restore-only counterpart of `lake_load`: attempts to populate this index from
+    // an on-disk snapshot file at `<root>/lake_pk_snapshot/<tablet_id>/v<base_version>.snapshot`
+    // and returns NotFound if no usable snapshot exists. Unlike `lake_load`, this
+    // path NEVER falls through to the cold-rebuild loop — pre-warm should never do
+    // the heavyweight work that a publish-time load would do anyway. Intended for
+    // boot-time pre-warm; takes the same lock as `lake_load`, so a concurrent
+    // publish-path `lake_load` either finds the index already loaded (early return)
+    // or proceeds with the cold rebuild while pre-warm waits its turn and then
+    // observes _loaded=true.
+    //
+    // Only applicable to CLOUD_NATIVE persistent-index tablets — returns NotFound
+    // for any other persistent-index type (LOCAL or non-persistent).
+    //
+    // [thread-safe]
+    Status try_lake_load_from_snapshot(TabletManager* tablet_mgr, const TabletMetadataPtr& metadata,
+                                       int64_t base_version);
+
 private:
     Status _do_lake_load(TabletManager* tablet_mgr, const TabletMetadataPtr& metadata, int64_t base_version,
                          const MetaFileBuilder* builder);

@@ -49,7 +49,23 @@ public:
 
     DISALLOW_COPY(LakePersistentIndex);
 
-    Status init(const TabletMetadataPtr& metadata);
+    // When `lazy_open_ssts` is true, the per-SST `Table::Open` (footer/index/filter block
+    // reads from OSS) is deferred. `_sstable_filesets` is built from `metadata->sstable_meta()`
+    // using lazy-mode `PersistentIndexSstable` stubs whose key-range routing is populated from
+    // the PB metadata, so subsequent `multi_get` calls only realize SSTs they actually target.
+    // Callers that need every SST opened before reading (e.g. on a snapshot-restore miss
+    // before a cold rebuild loop) must invoke `realize_filesets_eagerly()` afterwards.
+    Status init(const TabletMetadataPtr& metadata, bool lazy_open_ssts = false);
+
+    // Realize any deferred SST opens in `_sstable_filesets`. Idempotent and safe to call when
+    // init() ran in eager mode (no-op).
+    Status realize_filesets_eagerly();
+
+    // Returns true if a PK-index snapshot file is present on local disk for the given
+    // (tablet_id, captured_version) pair. Cheap path-existence check — does not read or
+    // validate the snapshot contents. Used pre-init by `LakePrimaryIndex::load_from_lake_tablet`
+    // to decide whether to enter lazy-open mode.
+    static bool snapshot_file_exists(int64_t tablet_id, int64_t captured_version);
 
     // batch get
     // |n|: size of key/value array
@@ -126,6 +142,23 @@ public:
     Status load_from_lake_tablet(TabletManager* tablet_mgr, const TabletMetadataPtr& metadata, int64_t base_version,
                                  const MetaFileBuilder* builder);
 
+    // Try to restore the in-memory state from a previously-captured local snapshot for the
+    // tablet+version pair currently being loaded. Returns Status::OK() on a successful restore;
+    // any other status (NotFound, version mismatch, corruption, etc.) means the caller must
+    // fall back to the full rebuild path. Gated by config::enable_pk_index_snapshot_persistence;
+    // when the flag is false this is a no-op that always returns NotFound.
+    //
+    // NOTE: this is a stub in the initial scaffolding PR — the on-disk format, serialisation,
+    // and validity rules will land in follow-up PRs. The signature is fixed here so callers
+    // can be wired before the implementation is complete.
+    Status try_restore_from_local_snapshot(TabletManager* tablet_mgr, const TabletMetadataPtr& metadata,
+                                           int64_t base_version);
+
+    // Persist a local snapshot capturing the current in-memory state. Caller is responsible
+    // for choosing the right moment (typically pre-eviction or BE shutdown). Gated by the
+    // same config flag; no-op when disabled. Stub in this scaffolding PR.
+    Status try_serialize_to_local_snapshot(TabletManager* tablet_mgr, const TabletMetadataPtr& metadata);
+
     size_t memory_usage() const override;
 
     int32_t current_fileset_index() const { return (int32_t)_sstable_filesets.size() - 1; }
@@ -160,9 +193,12 @@ public:
 private:
     // Open all SSTables in parallel using thread pool.
     // Returns opened SSTables in the same order as sstable_meta.sstables().
+    // When `lazy_open` is true, returns stubs (no OSS reads, no thread pool) — see
+    // `PersistentIndexSstable::new_sstable_lazy`. Used by lazy-mode init() so that
+    // snapshot-HIT loads avoid eagerly opening every SST.
     static StatusOr<std::vector<PersistentIndexSstableUniquePtr>> _open_sstables_parallel(
             const PersistentIndexSstableMetaPB& sstable_meta, TabletManager* tablet_mgr, int64_t tablet_id,
-            Cache* cache, const TabletMetadataPtr& metadata);
+            Cache* cache, const TabletMetadataPtr& metadata, bool lazy_open = false);
 
     bool is_memtable_full() const;
 

@@ -18,6 +18,7 @@
 
 #include "base/debug/trace.h"
 #include "base/testutil/sync_point.h"
+#include "common/config.h"
 #include "storage/chunk_helper.h"
 #include "storage/lake/lake_local_persistent_index.h"
 #include "storage/lake/lake_persistent_index.h"
@@ -26,6 +27,7 @@
 #include "storage/lake/rowset.h"
 #include "storage/lake/rowset_update_state.h"
 #include "storage/lake/tablet.h"
+#include "storage/lake/tablet_manager.h"
 #include "storage/persistent_index_parallel_publish_context.h"
 #include "storage/primary_key_encoder.h"
 #include "storage/tablet_meta_manager.h"
@@ -119,7 +121,15 @@ Status LakePrimaryIndex::_do_lake_load(TabletManager* tablet_mgr, const TabletMe
             _persistent_index = std::make_shared<LakePersistentIndex>(tablet_mgr, metadata->id());
             set_enable_persistent_index(true);
             auto* lake_persistent_index = dynamic_cast<LakePersistentIndex*>(_persistent_index.get());
-            RETURN_IF_ERROR(lake_persistent_index->init(metadata));
+            // Snapshot-HIT-likely loads enter lazy-open mode: a cheap path-existence check
+            // for the on-disk snapshot file gates whether init() builds opened sstables or
+            // deferred stubs. On a HIT the publish that triggered this load completes from
+            // the snapshot's restored memtable; SSTs whose key range never gets queried stay
+            // unopened. On a MISS load_from_lake_tablet realizes them before rebuild.
+            const bool lazy_open_ssts = config::enable_pk_index_snapshot_persistence &&
+                                        config::enable_pk_index_snapshot_lazy_sst_open &&
+                                        LakePersistentIndex::snapshot_file_exists(metadata->id(), base_version);
+            RETURN_IF_ERROR(lake_persistent_index->init(metadata, lazy_open_ssts));
             return lake_persistent_index->load_from_lake_tablet(tablet_mgr, metadata, base_version, builder);
         }
         default:
@@ -639,6 +649,98 @@ Status LakePrimaryIndex::parallel_upsert(ThreadPoolToken* token, uint32_t rssid,
         RETURN_IF_ERROR(flush_memtable());
     }
     return segment_pk_iterator->status();
+}
+
+Status LakePrimaryIndex::try_snapshot_to_local(TabletManager* tablet_mgr) {
+    if (!config::enable_pk_index_snapshot_persistence) {
+        return Status::OK();
+    }
+    if (tablet_mgr == nullptr) {
+        // UpdateManager torn down before tablet_mgr was set, or shutdown ordering removed
+        // tablet_mgr first. Without it we cannot fetch metadata; skip silently.
+        return Status::OK();
+    }
+    auto* lake_persistent_index = dynamic_cast<LakePersistentIndex*>(_persistent_index.get());
+    if (lake_persistent_index == nullptr) {
+        // Either persistent index is disabled for this tablet, or it's the LOCAL variant.
+        // The snapshot path only applies to CLOUD_NATIVE; nothing to do here.
+        return Status::OK();
+    }
+    // Acquire the per-index mutex non-blocking. If another thread is currently mutating
+    // the index (upsert / commit / compact), skip this entry — capturing in the middle
+    // of an apply would produce a torn snapshot. The next eviction / shutdown round will
+    // try again. The version-check at restore time is the final correctness backstop.
+    auto guard = try_fetch_guard();
+    if (guard == nullptr) {
+        return Status::OK();
+    }
+    if (_data_version <= 0) {
+        // Index is loaded but has not yet committed any version we can pin a snapshot to.
+        return Status::OK();
+    }
+    auto metadata_or = tablet_mgr->get_tablet_metadata(_tablet_id, _data_version, /*fill_cache=*/false);
+    if (!metadata_or.ok()) {
+        // Metadata for this version is no longer cached / fetchable. Skip silently — the
+        // restore-side validity rules would reject any snapshot whose recorded version
+        // does not match a live metadata anyway.
+        return Status::OK();
+    }
+    return lake_persistent_index->try_serialize_to_local_snapshot(tablet_mgr, *metadata_or);
+}
+
+Status LakePrimaryIndex::try_lake_load_from_snapshot(TabletManager* tablet_mgr, const TabletMetadataPtr& metadata,
+                                                     int64_t base_version) {
+    if (tablet_mgr == nullptr || metadata == nullptr) {
+        return Status::InvalidArgument("tablet_mgr / metadata must be non-null");
+    }
+    // Mirror lake_load: take _lock, early-return if already loaded at a fresh version.
+    std::lock_guard<std::mutex> lg(_lock);
+    if (_loaded && !need_rebuild()) {
+        return _status;
+    }
+    if (need_rebuild()) {
+        // Defer to the publish-path lake_load — pre-warm has nothing to add when a rebuild
+        // is required, and we explicitly do NOT want to run the cold-rebuild loop here.
+        return Status::NotFound("rebuild required, skip prewarm");
+    }
+    if (!metadata->enable_persistent_index() ||
+        metadata->persistent_index_type() != PersistentIndexTypePB::CLOUD_NATIVE) {
+        return Status::NotFound("prewarm only applies to CLOUD_NATIVE persistent-index tablets");
+    }
+
+    _tablet_id = metadata->id();
+
+    // Build the same key schema lake_load would set up so a subsequent publish does not
+    // need to redo this work.
+    auto tablet_schema = std::make_shared<TabletSchema>(metadata->schema());
+    std::vector<ColumnId> pk_columns(tablet_schema->num_key_columns());
+    for (size_t i = 0; i < tablet_schema->num_key_columns(); i++) {
+        pk_columns[i] = static_cast<ColumnId>(i);
+    }
+    auto pkey_schema = ChunkHelper::convert_schema(tablet_schema, pk_columns);
+    _set_schema(pkey_schema);
+
+    // Construct the cloud-native PK index, init from metadata, then call the public restore
+    // entry. On miss (NotFound) we leave _loaded=false so the caller does not insert a
+    // half-built entry into _index_cache; the next publish path will do the cold rebuild.
+    // Boot prewarm only succeeds when the snapshot file is present, so use lazy-open mode
+    // to avoid the OSS Table::Open work for tablets that won't be touched until first
+    // publish. The publish-time lake_load goes through `LakePrimaryIndex::load_from_lake_tablet`
+    // and the deferred opens are realized on demand by `multi_get` via `ensure_opened()`.
+    auto persistent = std::make_shared<LakePersistentIndex>(tablet_mgr, metadata->id());
+    const bool lazy_open_ssts = config::enable_pk_index_snapshot_lazy_sst_open;
+    RETURN_IF_ERROR(persistent->init(metadata, lazy_open_ssts));
+    Status restore_st = persistent->try_restore_from_local_snapshot(tablet_mgr, metadata, base_version);
+    if (!restore_st.ok()) {
+        return restore_st;
+    }
+
+    _persistent_index = std::move(persistent);
+    set_enable_persistent_index(true);
+    _status = Status::OK();
+    _loaded = true;
+    update_data_version(base_version);
+    return Status::OK();
 }
 
 } // namespace starrocks::lake
