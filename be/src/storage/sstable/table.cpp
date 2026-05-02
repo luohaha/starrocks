@@ -49,17 +49,23 @@ Status Table::Open(const Options& options, RandomAccessFile* file, uint64_t size
         return Status::Corruption("file is too short to be an sstable");
     }
 
-    char footer_space[Footer::kEncodedLength];
-    //Status s = file->Read(size - Footer::kEncodedLength, Footer::kEncodedLength, &footer_input, footer_space);
-    Status s = file->read_at_fully(size - Footer::kEncodedLength, footer_space, Footer::kEncodedLength);
+    // Prefetch the file tail in a single read so the footer + index +
+    // metaindex + filter blocks share one round-trip instead of taking
+    // 3-4 sequential ones. On high-latency object stores (e.g. S3) this
+    // is the dominant cost of cold-start per-SST `Table::Open`.
+    constexpr size_t kPrefetchTailSize = 64 * 1024;
+    const size_t prefetch_size = (size < kPrefetchTailSize) ? static_cast<size_t>(size) : kPrefetchTailSize;
+    const uint64_t prefetch_offset = size - prefetch_size;
+    std::vector<char> prefetch_buf(prefetch_size);
+    Status s = file->read_at_fully(prefetch_offset, prefetch_buf.data(), prefetch_size);
     if (!s.ok()) return s;
 
-    Slice footer_input(footer_space, Footer::kEncodedLength);
+    Slice footer_input(prefetch_buf.data() + prefetch_size - Footer::kEncodedLength, Footer::kEncodedLength);
     Footer footer;
     s = footer.DecodeFrom(&footer_input);
     if (!s.ok()) return s;
 
-    // Read the index block
+    // Read the index block — try the prefetched tail first, fall back to file.
     BlockContents index_block_contents;
     ReadOptions opt;
     ReadIOStat iostat;
@@ -67,7 +73,8 @@ Status Table::Open(const Options& options, RandomAccessFile* file, uint64_t size
     if (options.paranoid_checks) {
         opt.verify_checksums = true;
     }
-    s = ReadBlock(file, opt, footer.index_handle(), &index_block_contents);
+    s = ReadBlockMaybeFromPrefetch(file, prefetch_buf.data(), prefetch_offset, prefetch_size, opt,
+                                   footer.index_handle(), &index_block_contents);
 
     if (s.ok()) {
         // We've successfully read the footer and the index block: we're
@@ -82,7 +89,7 @@ Status Table::Open(const Options& options, RandomAccessFile* file, uint64_t size
         rep->filter_data = nullptr;
         rep->filter = nullptr;
         *table = new Table(rep);
-        (*table)->ReadMeta(footer);
+        (*table)->ReadMeta(footer, prefetch_buf.data(), prefetch_offset, prefetch_size);
     }
 
     return s;
@@ -122,7 +129,8 @@ Status Table::sample_keys(std::vector<std::string>* keys, size_t sample_interval
     return st;
 }
 
-void Table::ReadMeta(const Footer& footer) {
+void Table::ReadMeta(const Footer& footer, const char* prefetch_data, uint64_t prefetch_offset,
+                     size_t prefetch_size) {
     if (rep_->options.filter_policy == nullptr) {
         return; // Do not need any metadata
     }
@@ -136,7 +144,9 @@ void Table::ReadMeta(const Footer& footer) {
         opt.verify_checksums = true;
     }
     BlockContents contents;
-    if (!ReadBlock(rep_->file, opt, footer.metaindex_handle(), &contents).ok()) {
+    if (!ReadBlockMaybeFromPrefetch(rep_->file, prefetch_data, prefetch_offset, prefetch_size, opt,
+                                    footer.metaindex_handle(), &contents)
+                 .ok()) {
         // Do not propagate errors since meta info is not needed for operation
         return;
     }
@@ -147,13 +157,14 @@ void Table::ReadMeta(const Footer& footer) {
     key.append(rep_->options.filter_policy->Name());
     iter->Seek(key);
     if (iter->Valid() && iter->key() == Slice(key)) {
-        ReadFilter(iter->value());
+        ReadFilter(iter->value(), prefetch_data, prefetch_offset, prefetch_size);
     }
     delete iter;
     delete meta;
 }
 
-void Table::ReadFilter(const Slice& filter_handle_value) {
+void Table::ReadFilter(const Slice& filter_handle_value, const char* prefetch_data, uint64_t prefetch_offset,
+                       size_t prefetch_size) {
     Slice v = filter_handle_value;
     BlockHandle filter_handle;
     if (!filter_handle.DecodeFrom(&v).ok()) {
@@ -167,7 +178,9 @@ void Table::ReadFilter(const Slice& filter_handle_value) {
         opt.verify_checksums = true;
     }
     BlockContents block;
-    if (!ReadBlock(rep_->file, opt, filter_handle, &block).ok()) {
+    if (!ReadBlockMaybeFromPrefetch(rep_->file, prefetch_data, prefetch_offset, prefetch_size, opt, filter_handle,
+                                    &block)
+                 .ok()) {
         return;
     }
     if (block.heap_allocated) {

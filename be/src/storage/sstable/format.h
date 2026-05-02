@@ -88,6 +88,15 @@ struct BlockContents {
 // return non-OK.  On success fill *result and return OK.
 Status ReadBlock(RandomAccessFile* file, const ReadOptions& options, const BlockHandle& handle, BlockContents* result);
 
+// Same as ReadBlock, but tries to satisfy the read from a prefetched
+// in-memory buffer first. If the requested block does not fully fit inside
+// [prefetch_offset, prefetch_offset + prefetch_size), falls back to reading
+// from "file". Used by Table::Open to collapse the footer / index /
+// metaindex / filter sequential round-trips into a single tail prefetch.
+Status ReadBlockMaybeFromPrefetch(RandomAccessFile* file, const char* prefetch_data, uint64_t prefetch_offset,
+                                  size_t prefetch_size, const ReadOptions& options, const BlockHandle& handle,
+                                  BlockContents* result);
+
 // Implementation details follow.  Clients should ignore,
 
 inline BlockHandle::BlockHandle() : offset_(~static_cast<uint64_t>(0)), size_(~static_cast<uint64_t>(0)) {}
