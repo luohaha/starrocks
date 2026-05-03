@@ -153,4 +153,59 @@ Status ReadBlock(RandomAccessFile* input_file, const ReadOptions& options, const
     return Status::OK();
 }
 
+Status ReadBlockMaybeFromPrefetch(RandomAccessFile* file, const char* prefetch_data, uint64_t prefetch_offset,
+                                  size_t prefetch_size, const ReadOptions& options, const BlockHandle& handle,
+                                  BlockContents* result) {
+    const size_t n = static_cast<size_t>(handle.size());
+    const uint64_t end = handle.offset() + n + kBlockTrailerSize;
+    if (prefetch_data == nullptr || handle.offset() < prefetch_offset || end > prefetch_offset + prefetch_size) {
+        return ReadBlock(file, options, handle, result);
+    }
+
+    result->data = Slice();
+    result->cachable = false;
+    result->heap_allocated = false;
+
+    const char* data = prefetch_data + (handle.offset() - prefetch_offset);
+    if (options.verify_checksums) {
+        const uint32_t crc = crc32c::Unmask(DecodeFixed32(data + n + 1));
+        const uint32_t actual = crc32c::Value(data, n + 1);
+        if (actual != crc) {
+            return Status::Corruption("block checksum mismatch");
+        }
+    }
+
+    switch (data[n]) {
+    case kNoCompression: {
+        // Copy out so BlockContents owns the bytes — the prefetch buffer is
+        // local to Table::Open and freed when this call returns.
+        char* buf = new char[n];
+        memcpy(buf, data, n);
+        result->data = Slice(buf, n);
+        result->heap_allocated = true;
+        result->cachable = true;
+        break;
+    }
+    case kSnappyCompression: {
+        size_t ulength = 0;
+        if (!snappy::GetUncompressedLength(data, n, &ulength)) {
+            return Status::Corruption("corrupted compressed block contents");
+        }
+        char* ubuf = new char[ulength];
+        if (!snappy::RawUncompress(data, n, ubuf)) {
+            delete[] ubuf;
+            return Status::Corruption("corrupted compressed block contents");
+        }
+        result->data = Slice(ubuf, ulength);
+        result->heap_allocated = true;
+        result->cachable = true;
+        break;
+    }
+    default:
+        return Status::Corruption("bad block type");
+    }
+
+    return Status::OK();
+}
+
 } // namespace starrocks::sstable

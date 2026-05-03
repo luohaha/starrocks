@@ -49,17 +49,59 @@ Status Table::Open(const Options& options, RandomAccessFile* file, uint64_t size
         return Status::Corruption("file is too short to be an sstable");
     }
 
-    char footer_space[Footer::kEncodedLength];
-    //Status s = file->Read(size - Footer::kEncodedLength, Footer::kEncodedLength, &footer_input, footer_space);
-    Status s = file->read_at_fully(size - Footer::kEncodedLength, footer_space, Footer::kEncodedLength);
+    // Cold-start `Table::Open` previously issued 4 sequential `read_at_fully`
+    // calls per file: footer, index block, metaindex block, filter block.
+    // On high-latency object stores like S3 those are the dominant cost of
+    // opening a PK-index SST (12-17 SSTs per tablet => 48-68 sequential RTT
+    // on the per-publish critical path).
+    //
+    // The plan here is a footer-driven adaptive prefetch:
+    //   Stage 1: read a 1 MB tail. This typically captures footer +
+    //            metaindex + index in one round-trip.
+    //   Stage 1' (rare): if metaindex/index sit before the 1 MB tail (very
+    //            large indexes — happens at small `block_size`), extend the
+    //            prefetch backwards to cover them. Single extra read.
+    //   Stage 2: filter block sits *before* metaindex in the standard
+    //            SSTable layout, so unless the file is small enough to fit
+    //            entirely in stage 1 the filter falls outside the prefetch.
+    //            Read [filter_handle.offset, prefetch_offset) once more.
+    //
+    // Worst case is 3 reads (vs 4 before); typical case for SSTs whose
+    // footer+meta+index already fit in 1 MB is 2 reads; very small SSTs
+    // collapse to 1 read.
+    constexpr size_t kStage1TailSize = 1 * 1024 * 1024;
+    const size_t stage1_size = (size < kStage1TailSize) ? static_cast<size_t>(size) : kStage1TailSize;
+    const uint64_t stage1_offset = size - stage1_size;
+    std::vector<char> prefetch_buf(stage1_size);
+    Status s = file->read_at_fully(stage1_offset, prefetch_buf.data(), stage1_size);
     if (!s.ok()) return s;
 
-    Slice footer_input(footer_space, Footer::kEncodedLength);
+    Slice footer_input(prefetch_buf.data() + stage1_size - Footer::kEncodedLength, Footer::kEncodedLength);
     Footer footer;
     s = footer.DecodeFrom(&footer_input);
     if (!s.ok()) return s;
 
-    // Read the index block
+    uint64_t prefetch_offset = stage1_offset;
+    size_t prefetch_size = stage1_size;
+
+    // Stage 1' (rare): if either metaindex_handle or index_handle starts
+    // before the stage-1 tail, do one read to bring them in. We extend the
+    // existing prefetch buffer in front so a single contiguous range
+    // [needed_start, size) is available without a second buffer.
+    const uint64_t needed_start =
+            std::min(footer.metaindex_handle().offset(), footer.index_handle().offset());
+    if (needed_start < prefetch_offset) {
+        const size_t front_size = static_cast<size_t>(prefetch_offset - needed_start);
+        std::vector<char> extended(front_size + prefetch_size);
+        Status s_front = file->read_at_fully(needed_start, extended.data(), front_size);
+        if (!s_front.ok()) return s_front;
+        memcpy(extended.data() + front_size, prefetch_buf.data(), prefetch_size);
+        prefetch_buf = std::move(extended);
+        prefetch_offset = needed_start;
+        prefetch_size = front_size + stage1_size;
+    }
+
+    // Read the index block — try the prefetched tail first, fall back to file.
     BlockContents index_block_contents;
     ReadOptions opt;
     ReadIOStat iostat;
@@ -67,7 +109,8 @@ Status Table::Open(const Options& options, RandomAccessFile* file, uint64_t size
     if (options.paranoid_checks) {
         opt.verify_checksums = true;
     }
-    s = ReadBlock(file, opt, footer.index_handle(), &index_block_contents);
+    s = ReadBlockMaybeFromPrefetch(file, prefetch_buf.data(), prefetch_offset, prefetch_size, opt,
+                                   footer.index_handle(), &index_block_contents);
 
     if (s.ok()) {
         // We've successfully read the footer and the index block: we're
@@ -82,7 +125,7 @@ Status Table::Open(const Options& options, RandomAccessFile* file, uint64_t size
         rep->filter_data = nullptr;
         rep->filter = nullptr;
         *table = new Table(rep);
-        (*table)->ReadMeta(footer);
+        (*table)->ReadMeta(footer, prefetch_buf.data(), prefetch_offset, prefetch_size);
     }
 
     return s;
@@ -122,7 +165,8 @@ Status Table::sample_keys(std::vector<std::string>* keys, size_t sample_interval
     return st;
 }
 
-void Table::ReadMeta(const Footer& footer) {
+void Table::ReadMeta(const Footer& footer, const char* prefetch_data, uint64_t prefetch_offset,
+                     size_t prefetch_size) {
     if (rep_->options.filter_policy == nullptr) {
         return; // Do not need any metadata
     }
@@ -136,7 +180,9 @@ void Table::ReadMeta(const Footer& footer) {
         opt.verify_checksums = true;
     }
     BlockContents contents;
-    if (!ReadBlock(rep_->file, opt, footer.metaindex_handle(), &contents).ok()) {
+    if (!ReadBlockMaybeFromPrefetch(rep_->file, prefetch_data, prefetch_offset, prefetch_size, opt,
+                                    footer.metaindex_handle(), &contents)
+                 .ok()) {
         // Do not propagate errors since meta info is not needed for operation
         return;
     }
@@ -147,13 +193,44 @@ void Table::ReadMeta(const Footer& footer) {
     key.append(rep_->options.filter_policy->Name());
     iter->Seek(key);
     if (iter->Valid() && iter->key() == Slice(key)) {
-        ReadFilter(iter->value());
+        // Decode the filter handle so we can decide whether the filter block
+        // already lives inside the existing prefetch buffer. If not, do a
+        // single contiguous stage-2 read covering [filter_handle.offset,
+        // prefetch_offset). In the standard SSTable layout the filter block
+        // sits immediately before metaindex, so this is just the filter
+        // block (no wasted gap).
+        Slice handle_slice = iter->value();
+        BlockHandle filter_handle;
+        if (filter_handle.DecodeFrom(&handle_slice).ok()) {
+            const size_t fh_total = static_cast<size_t>(filter_handle.size()) + kBlockTrailerSize;
+            const uint64_t fh_end = filter_handle.offset() + fh_total;
+            const bool in_prefetch = (prefetch_data != nullptr) && (filter_handle.offset() >= prefetch_offset) &&
+                                     (fh_end <= prefetch_offset + prefetch_size);
+            if (in_prefetch) {
+                ReadFilter(iter->value(), prefetch_data, prefetch_offset, prefetch_size);
+            } else {
+                const uint64_t stage2_end = (prefetch_data != nullptr) ? prefetch_offset : fh_end;
+                if (stage2_end > filter_handle.offset()) {
+                    const size_t stage2_size = static_cast<size_t>(stage2_end - filter_handle.offset());
+                    std::vector<char> stage2_buf(stage2_size);
+                    Status s2 = rep_->file->read_at_fully(filter_handle.offset(), stage2_buf.data(), stage2_size);
+                    if (s2.ok()) {
+                        ReadFilter(iter->value(), stage2_buf.data(), filter_handle.offset(), stage2_size);
+                    }
+                    // If stage-2 fails, the filter is just skipped — it is optional.
+                } else {
+                    // No prefetch context available; fall back to direct read.
+                    ReadFilter(iter->value(), nullptr, 0, 0);
+                }
+            }
+        }
     }
     delete iter;
     delete meta;
 }
 
-void Table::ReadFilter(const Slice& filter_handle_value) {
+void Table::ReadFilter(const Slice& filter_handle_value, const char* prefetch_data, uint64_t prefetch_offset,
+                       size_t prefetch_size) {
     Slice v = filter_handle_value;
     BlockHandle filter_handle;
     if (!filter_handle.DecodeFrom(&v).ok()) {
@@ -167,7 +244,9 @@ void Table::ReadFilter(const Slice& filter_handle_value) {
         opt.verify_checksums = true;
     }
     BlockContents block;
-    if (!ReadBlock(rep_->file, opt, filter_handle, &block).ok()) {
+    if (!ReadBlockMaybeFromPrefetch(rep_->file, prefetch_data, prefetch_offset, prefetch_size, opt, filter_handle,
+                                    &block)
+                 .ok()) {
         return;
     }
     if (block.heap_allocated) {

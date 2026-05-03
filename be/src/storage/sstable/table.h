@@ -64,8 +64,9 @@ private:
 
     explicit Table(Rep* rep) : rep_(rep) {}
 
-    void ReadMeta(const Footer& footer);
-    void ReadFilter(const Slice& filter_handle_value);
+    void ReadMeta(const Footer& footer, const char* prefetch_data, uint64_t prefetch_offset, size_t prefetch_size);
+    void ReadFilter(const Slice& filter_handle_value, const char* prefetch_data, uint64_t prefetch_offset,
+                    size_t prefetch_size);
 
     Rep* const rep_;
 };
