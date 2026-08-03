@@ -421,6 +421,17 @@ Status DeltaWriter::_check_partial_update_with_sort_key(const Chunk& chunk) {
 Status DeltaWriter::write(const Chunk& chunk, const uint32_t* indexes, uint32_t from, uint32_t size) {
     SCOPED_THREAD_LOCAL_MEM_SETTER(_mem_tracker, false);
     RETURN_IF_ERROR(_check_partial_update_with_sort_key(chunk));
+    // A column addresses its bytes with uint32 offsets, so a chunk wider than that cannot be
+    // carried through to apply. Fail the load here, where the statement can still be retried with
+    // less data per batch, rather than let it commit and leave apply to fail on every retry -- and
+    // a wrapped offset does not always fail there, it can also copy the right number of bytes from
+    // the wrong address, which reaches disk looking self-consistent.
+    if (auto st = chunk.capacity_limit_reached(); !st.ok()) {
+        return Status::CapacityLimitExceed(
+                fmt::format("chunk is too large to write to tablet {}: {}. Reduce the number of rows per batch, or "
+                            "the size of the string/array values in it.",
+                            _opt.tablet_id, st.message()));
+    }
     ADD_COUNTER_RELAXED(_stats.write_count, 1);
     ADD_COUNTER_RELAXED(_stats.row_count, size);
     int64_t start_time = MonotonicNanos();

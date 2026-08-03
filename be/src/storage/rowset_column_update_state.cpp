@@ -14,6 +14,11 @@
 
 #include "rowset_column_update_state.h"
 
+#include <algorithm>
+#include <limits>
+
+#include "column/chunk.h"
+#include "column/column.h"
 #include "common/tracer.h"
 #include "fs/fs_util.h"
 #include "gutil/strings/substitute.h"
@@ -36,6 +41,24 @@
 #include "util/time.h"
 
 namespace starrocks {
+
+// BinaryColumn addresses its bytes with uint32 offsets, so a chunk holding more than 4GB of string
+// data wraps them and they stop describing its own buffer. Nothing on this path is sized in bytes
+// -- read batches and .upt files are sized in rows -- so wide values get there easily. A wrap is
+// not reliably an error either: depending on where it lands the next read of those offsets throws,
+// reads out of bounds, or copies the right number of bytes from an address 2^32 too low, which
+// reaches disk with self-consistent offsets and cannot be told apart from correct data afterwards.
+// Refuse the chunk instead. Column mode partial update of values this wide is not supported here.
+static Status reject_if_over_capacity(const Chunk& chunk, const char* what, int64_t tablet_id, int64_t txn_id) {
+    Status st = chunk.capacity_limit_reached();
+    if (st.ok()) {
+        return st;
+    }
+    return Status::CapacityLimitExceed(
+            strings::Substitute("column mode partial update: $0 is too large for tablet:$1 txn:$2, $3. Reduce the "
+                                "amount of data updated per statement.",
+                                what, tablet_id, txn_id, std::string(st.message())));
+}
 
 RowsetColumnUpdateState::RowsetColumnUpdateState() = default;
 
@@ -345,7 +368,37 @@ static Status read_from_source_segment_and_update(
     ChunkUniquePtr tmp_chunk_ptr;
     TRY_CATCH_BAD_ALLOC(source_chunk_ptr = ChunkHelper::new_chunk(schema, config::vector_chunk_size));
     TRY_CATCH_BAD_ALLOC(tmp_chunk_ptr = ChunkHelper::new_chunk(schema, config::vector_chunk_size));
+    const int64_t tablet_id = tablet->tablet_id();
+    const int64_t txn_id = rowset->txn_id();
     uint32_t start_rowid = 0;
+    // The container is handed to update_rows() next, which merges the .upt values in on top of it,
+    // so it holds both halves. The row cap below bounds the merged-in half at the same budget, so
+    // clamp the budget to half the ceiling to keep their sum under it. The config already defaults
+    // to exactly that, which leaves a default install on the budget it has always had; only an
+    // operator who raised it sees a smaller one, and that is the case that has to be clamped.
+    const int64_t container_byte_budget = std::min<int64_t>(config::partial_update_memory_limit_per_worker,
+                                                            (int64_t)(Column::MAX_CAPACITY_LIMIT / 2));
+    // Keep the row cap as the memory estimate it was meant to be, but stop using it as the only
+    // bound. It multiplies the source row count by the *.upt* per-row size, and those are different
+    // populations: the .upt holds the new values of the rows this transaction updates, while the
+    // container holds the old values of every row in the segment. When the update shrinks values,
+    // or simply touches a small fraction of rows, the estimate collapses and the container grows
+    // with no effective bound -- it is what let a container reach several GB while this check still
+    // read as under budget. Measure the container itself as well, below.
+    const size_t max_container_rows =
+            upt_memory_usage_per_row > 0
+                    ? std::max<size_t>(1, (size_t)(container_byte_budget / upt_memory_usage_per_row))
+                    : std::numeric_limits<size_t>::max();
+    auto emit_container = [&](bool print_log) {
+        StreamChunkContainer container = {
+                .chunk_ptr = source_chunk_ptr.get(),
+                .start_rowid = start_rowid,
+                .end_rowid = start_rowid + static_cast<uint32_t>(source_chunk_ptr->num_rows())};
+        RETURN_IF_ERROR(update_func(container, print_log, upt_memory_usage_per_row));
+        start_rowid += static_cast<uint32_t>(source_chunk_ptr->num_rows());
+        source_chunk_ptr->reset();
+        return Status::OK();
+    };
     while (true) {
         tmp_chunk_ptr->reset();
         auto st = seg_iter->get_next(tmp_chunk_ptr.get());
@@ -353,33 +406,42 @@ static Status read_from_source_segment_and_update(
             break;
         } else if (!st.ok()) {
             return st;
-        } else {
-            source_chunk_ptr->append(*tmp_chunk_ptr);
-            // Avoid too many memory usage and Column overflow, we will limit source chunk's size.
-            if (source_chunk_ptr->num_rows() >= INT32_MAX ||
-                (int64_t)source_chunk_ptr->num_rows() * upt_memory_usage_per_row >
-                        config::partial_update_memory_limit_per_worker) {
-                // Because we will handle columns group by group (define by config::vertical_compaction_max_columns_per_group),
-                // so use `upt_memory_usage_per_row` to estimate source chunk future memory cost will be overvalued.
-                // But it's better to be overvalued than undervalued.
-                StreamChunkContainer container = {
-                        .chunk_ptr = source_chunk_ptr.get(),
-                        .start_rowid = start_rowid,
-                        .end_rowid = start_rowid + static_cast<uint32_t>(source_chunk_ptr->num_rows())};
-                RETURN_IF_ERROR(update_func(container, true /*print log*/, upt_memory_usage_per_row));
-                start_rowid += static_cast<uint32_t>(source_chunk_ptr->num_rows());
-                source_chunk_ptr->reset();
+        }
+        // Batches are sized in rows, so a segment of wide rows can hand back more than a column can
+        // address in a single get_next(). Reject the batch before appending from it: appending
+        // reads the source offsets, and reading offsets that have already wrapped is what throws or
+        // silently copies from the wrong address.
+        RETURN_IF_ERROR(reject_if_over_capacity(*tmp_chunk_ptr, "source segment read batch", tablet_id, txn_id));
+        size_t offset = 0;
+        while (offset < tmp_chunk_ptr->num_rows()) {
+            if (source_chunk_ptr->num_rows() >= max_container_rows) {
+                RETURN_IF_ERROR(emit_container(true /*print log*/));
+            }
+            size_t count =
+                    std::min(max_container_rows - source_chunk_ptr->num_rows(), tmp_chunk_ptr->num_rows() - offset);
+            while (count > 1 && (int64_t)tmp_chunk_ptr->bytes_usage(offset, count) > container_byte_budget) {
+                count /= 2;
+            }
+            // Flush before taking the slice rather than after: the old code appended a whole batch
+            // and only then asked whether the container was too big, and one batch of wide rows is
+            // already several GB by itself.
+            if (!source_chunk_ptr->is_empty() &&
+                (int64_t)source_chunk_ptr->bytes_usage() + (int64_t)tmp_chunk_ptr->bytes_usage(offset, count) >
+                        container_byte_budget) {
+                RETURN_IF_ERROR(emit_container(true /*print log*/));
+            }
+            source_chunk_ptr->append(*tmp_chunk_ptr, offset, count);
+            // A single row can be wider than the whole budget, so the slice above is not always
+            // enough on its own.
+            RETURN_IF_ERROR(reject_if_over_capacity(*source_chunk_ptr, "source chunk", tablet_id, txn_id));
+            offset += count;
+            if (source_chunk_ptr->num_rows() >= INT32_MAX) {
+                RETURN_IF_ERROR(emit_container(true /*print log*/));
             }
         }
     }
     if (!source_chunk_ptr->is_empty()) {
-        StreamChunkContainer container = {
-                .chunk_ptr = source_chunk_ptr.get(),
-                .start_rowid = start_rowid,
-                .end_rowid = start_rowid + static_cast<uint32_t>(source_chunk_ptr->num_rows())};
-        RETURN_IF_ERROR(update_func(container, false /*print log*/, upt_memory_usage_per_row));
-        start_rowid += static_cast<uint32_t>(source_chunk_ptr->num_rows());
-        source_chunk_ptr->reset();
+        RETURN_IF_ERROR(emit_container(false /*print log*/));
     }
     return Status::OK();
 }
@@ -454,6 +516,15 @@ Status RowsetColumnUpdateState::_update_source_chunk_by_upt(const UptidToRowidPa
                                                             OlapReaderStatistics* stats, MemTracker* tracker,
                                                             StreamChunkContainer container) {
     CHECK_MEM_LIMIT("RowsetColumnUpdateState::_update_source_chunk_by_upt");
+    const int64_t tablet_id = _tablet_id;
+    const int64_t txn_id = rowset->txn_id();
+    // The caller bounds the container, but check before consuming it rather than trusting that.
+    // update_rows() rebuilds the column by copying the ranges between the rows it replaces, and
+    // where a wrapped offset lands decides what happens: inside one of those ranges the span goes
+    // negative and it throws, but inside a row being replaced the ranges are split around it and
+    // each copies the right number of bytes from the wrong address. That output carries offsets
+    // consistent with its own buffer, so this is the last point where it is still detectable.
+    RETURN_IF_ERROR(reject_if_over_capacity(*container.chunk_ptr, "source chunk", tablet_id, txn_id));
     // handle upt files one by one
     for (const auto& each : upt_id_to_rowid_pairs) {
         const uint32_t upt_id = each.first;
@@ -467,6 +538,10 @@ Status RowsetColumnUpdateState::_update_source_chunk_by_upt(const UptidToRowidPa
             }
         });
         RETURN_IF_ERROR(read_chunk_from_update_file(update_iterator, upt_chunk));
+        // A whole .upt file lands in one chunk, because the upt rowids below index into it, so
+        // unlike the source read it cannot be split. Reject it before append_selective() reads its
+        // offsets.
+        RETURN_IF_ERROR(reject_if_over_capacity(*upt_chunk, "upt file chunk", tablet_id, txn_id));
         const size_t upt_chunk_size = upt_chunk->memory_usage();
         tracker->consume(upt_chunk_size);
         DeferOp tracker_defer([&]() { tracker->release(upt_chunk_size); });
@@ -482,6 +557,10 @@ Status RowsetColumnUpdateState::_update_source_chunk_by_upt(const UptidToRowidPa
                 tmp_chunk->append_selective(*upt_chunk, unsorted_upt_rowids.data(), 0, unsorted_upt_rowids.size()));
         // update source chunk use upt rows
         RETURN_IF_EXCEPTION(container.chunk_ptr->update_rows(*tmp_chunk, sorted_source_rowids.data()));
+        // The merge writes values wider than the ones it replaces, so the result can be over the
+        // limit even though both inputs were under it. The container is also reused by the next
+        // .upt file in this loop, which reads its offsets again.
+        RETURN_IF_ERROR(reject_if_over_capacity(*container.chunk_ptr, "merged source chunk", tablet_id, txn_id));
     }
     return Status::OK();
 }
